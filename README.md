@@ -12,6 +12,7 @@ hackrf_sweep ──► detect (noise floor + SNR + persistence) ──► identi
 ```bash
 sudo apt install hackrf          # provides hackrf_sweep and hackrf_transfer
 pip install -e .                 # needs Python 3.9+ and numpy
+pip install -e '.[web]'          # optional: adds the browser interface (FastAPI + uvicorn)
 hackrf-scout update-db           # one-off: downloads the SigID Wiki database (~300 MB), keeps ~1 MB of JSON
 ```
 
@@ -26,6 +27,9 @@ hackrf-scout scan --region-keywords greece,cyprus
 # Only some ranges, with the RF amp on (weak signals)
 hackrf-scout scan -f 400:470 -f 860:960 -a
 
+# Or by band name (see "Bands" below): 433 MHz ISM, 868 MHz SRD and the 2.4 GHz band
+hackrf-scout scan -f 433 -f 868 -f 2.4ghz
+
 # Scan 10 minutes, then record 5 s of IQ from the best new signals, repeat forever
 hackrf-scout run --scan-seconds 600 --capture-seconds 5 --capture-max 5
 
@@ -33,6 +37,7 @@ hackrf-scout run --scan-seconds 600 --capture-seconds 5 --capture-max 5
 hackrf-scout report                     # everything
 hackrf-scout report --unidentified -v   # the interesting ones, with candidate matches
 hackrf-scout report --band 430:440 --sort max_snr
+hackrf-scout report --band 868          # a band name works anywhere a range does
 hackrf-scout export --format csv > signals.csv
 hackrf-scout export --format json --observations > signals.json
 
@@ -49,6 +54,55 @@ hackrf-scout simulate -f 1:3000 -N 12 > sim.csv
 hackrf-scout scan --source sim.csv --db demo.db
 hackrf-scout report --db demo.db
 ```
+
+## Web interface
+
+```bash
+pip install -e '.[web]'
+hackrf-scout web                      # http://127.0.0.1:8765, watch and browse only
+hackrf-scout web --allow-control      # also start and stop the scanner from the browser
+```
+
+Run it on the machine that has the HackRF and `scout.db` (SQLite's WAL mode does not work over network drives). It can run next to a scan started from a terminal.
+
+| Tab | What it does |
+|---|---|
+| **Live** | Scanner status, counters, and the **live log**: new signals, sweep progress, the output of `hackrf_sweep`, errors. With `--allow-control` it also has the start/stop form. |
+| **Signals** | Every stored signal, filtered by band, identification, hits, SNR or text; sortable and paged. Click a row for candidates, bands, signal-strength history and observations. CSV/JSON export of the current filter. |
+| **Bands** | One row per band (433, 868, 2.4 GHz, ...): signal count, unidentified count, best SNR, activity over time, and the `scan -f` command that revisits only that band. |
+| **Data** | Read-only view of every table in the database (`signals`, `observations`, `sweeps`, `captures`, `log`, `meta`). |
+
+### Bands
+
+Anywhere a range is accepted (`report --band`, `scan -f`, the web filters) you can use a band name or `START:STOP` in MHz. Presets include `433`, `868`, `2.4ghz`, `5.8ghz`, `pmr446`, `dect`, `fm`, `airband`, `marine`, `ham2m`, `ham70cm`, `tetra`, `gsm900`, `gsm1800`, `adsb`, `gnss`, and the umbrella bands `vhf` (30-300 MHz) and `uhf` (300-3000 MHz). UHF is almost half the spectrum, so the practical sub-bands are usually what you want. The full list is at `/api/bands` or in `hackrf_scout/bands.py`.
+
+Add your own in `~/.hackrf-scout/bands.json` (or `--bands-file`, or `HACKRF_SCOUT_BANDS`):
+
+```json
+{"bands": [{"key": "garage", "name": "Garage remotes", "lo_mhz": 433.0, "hi_mhz": 435.0, "group": "Mine"}]}
+```
+
+The web filters match a signal if **any part of its bandwidth** overlaps the band, so a 20 MHz Wi-Fi channel centred just under 2400 MHz still counts for `2.4ghz`. Switch to "centre frequency inside band" if you prefer the strict reading (the CLI `report --band` always uses the centre).
+
+When you scan, `hackrf_sweep` needs whole MHz, so a band is rounded outwards (433.05-434.79 MHz scans as `433:435`).
+
+### Start and stop from the browser
+
+* The server starts `hackrf-scout scan` or `run` as a **separate, detached process**, so a scan keeps going if you close the browser or restart the web server. Stop sends SIGINT: the scanner finishes its current sweep, commits and exits (SIGTERM, then SIGKILL, only if it does not).
+* The HackRF can only be used by one program, so every `scan`, `run` and `capture` now holds a lock (`~/.hackrf-scout/scanner.lock`, a kernel `flock`, so a crash never leaves it stuck). A second start gets a clear error; the web UI shows scans started from a terminal too, and can stop them. Replaying a file with `scan --source` needs no hardware and takes no lock.
+* Stopping loses signal candidates that have not yet reached `--min-hits`; confirmed signals and the sweep counter are kept.
+* The form only offers receive modes and fixed, validated ranges. The database, executables and capture folder come from the server's command line (`--db`, `--hackrf-sweep`, `--hackrf-transfer`, `--capture-dir`), never from the browser. Linux and macOS only.
+
+### Security
+
+* Listens on `127.0.0.1` only. Another address needs `--token` (or `HACKRF_SCOUT_TOKEN`); the server refuses to start without one.
+* `--allow-control` is off by default. When on and no token is given, a random one is generated and printed as a link (`http://127.0.0.1:8765/#token=...`); open that link once. The token travels in an `Authorization` header and is kept in the tab's session storage, not in cookies or URLs.
+* The `Host` header must be local (DNS rebinding protection; add names with `--allowed-host`), cross-site POSTs are rejected, and a strict Content-Security-Policy applies (no inline scripts, no external resources).
+* The database is opened read-only, table and column names are whitelisted, and there is no SQL console. IQ recordings are not served over HTTP: your legal note below applies to who can reach them.
+
+### API
+
+JSON under `/api` (all `GET` unless noted): `status`, `signals` (`band`, `mode`, `unidentified`, `min_hits`, `min_snr`, `q`, `sort`, `order`, `page`, `page_size`), `signals/{id}`, `signals/export?format=csv|json`, `observations`, `sweeps`, `captures`, `bands`, `bands/summary`, `bands/activity`, `tables`, `tables/{name}`, `log?tail=N|after=ID`, `log/stream` (server-sent events, resumes with `Last-Event-ID`), `scanner`, and `POST scanner/start|stop|check` (only with `--allow-control`).
 
 ## How identification works
 
@@ -79,7 +133,8 @@ Treat names as leads, not facts. Many consumer devices (key fobs, sensors) share
 
 ## Files
 
-* `scout.db`: SQLite with tables `signals`, `observations`, `sweeps`, `captures`, `meta`.
+* `scout.db`: SQLite with tables `signals`, `observations`, `sweeps`, `captures`, `log` (the last 5000 log lines, shown in the web UI), `meta`.
+* `~/.hackrf-scout/`: `scanner.lock` and `scanner.json` (who is using the HackRF), `scanner.out` (console output of a scan started from the browser), optional `bands.json`. Override the folder with `HACKRF_SCOUT_STATE_DIR`.
 * `captures/`: `sigNNNN_<freq>MHz_<time>.cs8` (signed 8-bit interleaved IQ) plus a `.json` sidecar with centre frequency, sample rate and gains.
 
 ## Legal note
@@ -95,3 +150,5 @@ Signal database: [Artemis-DB](https://github.com/AresValley/Artemis), built from
 ```bash
 python3 -m unittest discover -s tests
 ```
+
+The web tests need `pip install -e '.[web,dev]'` and are skipped without it. They use fake `hackrf_*` programs, so no hardware is involved.

@@ -15,7 +15,7 @@ import shutil
 import subprocess
 import threading
 from dataclasses import dataclass
-from typing import Iterable, Iterator, List, Optional
+from typing import Callable, Iterable, Iterator, List, Optional
 
 import numpy as np
 
@@ -79,17 +79,22 @@ def iter_sweeps(lines: Iterable[str], wrap_hz: float = 30e6) -> Iterator[Sweep]:
 
     A sweep is yielded when the *next* sweep starts (or the input ends), so a
     partially received final sweep is never returned if the caller stops early.
+    A new sweep starts when the frequency jumps back by more than `wrap_hz`, or when a
+    chunk that is already part of the current sweep shows up again. The second rule is
+    what makes narrow scans (`-f 433:435`, a span under `wrap_hz`) work at all.
     """
     segs: List[Segment] = []
+    seen = set()
     max_lo = -1.0
     for line in lines:
         seg = parse_line(line)
         if seg is None:
             continue
-        if segs and seg.lo < max_lo - wrap_hz:
+        if segs and (seg.lo < max_lo - wrap_hz or seg.lo in seen):
             yield _build(segs)
-            segs, max_lo = [], -1.0
+            segs, seen, max_lo = [], set(), -1.0
         segs.append(seg)
+        seen.add(seg.lo)
         max_lo = max(max_lo, seg.lo)
     if segs:
         yield _build(segs)
@@ -116,7 +121,8 @@ def build_sweep_command(
 class SweepProcess:
     """Run hackrf_sweep and expose its stdout as an iterator of lines."""
 
-    def __init__(self, cmd: List[str]):
+    def __init__(self, cmd: List[str], on_stderr: Optional[Callable[[str], None]] = None):
+        self.on_stderr = on_stderr
         if shutil.which(cmd[0]) is None:
             raise RuntimeError(
                 f"'{cmd[0]}' not found. Install the HackRF tools "
@@ -140,6 +146,11 @@ class SweepProcess:
         assert self.proc.stderr is not None
         for line in self.proc.stderr:
             self.stderr_tail.append(line.rstrip())
+            if self.on_stderr is not None:
+                try:
+                    self.on_stderr(line.rstrip())
+                except Exception:  # logging must never break the sweep reader
+                    pass
 
     def lines(self) -> Iterator[str]:
         assert self.proc.stdout is not None
