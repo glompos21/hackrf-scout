@@ -4,7 +4,7 @@ Sweep the whole HackRF range (1 MHz – 6 GHz), find signals, work out what they
 
 ```
 hackrf_sweep ──► detect (noise floor + SNR + persistence) ──► identify (Artemis/SigID Wiki + bandplan) ──► SQLite
-                                                                                                    └──► IQ captures (.cs8 + .json)
+                                                                                                    └──► IQ captures (SigMF)
 ```
 
 ## Install
@@ -167,7 +167,7 @@ Treat names as leads, not facts. Many consumer devices (key fobs, sensors) share
 
 * `scout.db`: SQLite with tables `signals`, `observations`, `sweeps`, `captures`, `scans` (one row per scan session with its frequency ranges, used by the baselines), `log` (the last 5000 log lines, shown in the web UI), `meta`.
 * `~/.hackrf-scout/`: `scanner.lock` and `scanner.json` (who is using the HackRF), `scanner.out` (console output of a scan started from the browser), optional `bands.json`. Override the folder with `HACKRF_SCOUT_STATE_DIR`.
-* `captures/`: `sigNNNN_<freq>MHz_<time>.cs8` (signed 8-bit interleaved IQ) plus a `.json` sidecar with centre frequency, sample rate and gains.
+* `captures/`: IQ recordings in [SigMF](https://sigmf.org). Each is a pair: `sigNNNN_<freq>MHz_<time>.sigmf-data` is signed 8-bit interleaved I/Q, byte for byte what `hackrf_transfer` writes (SigMF calls it `ci8`), and the `.sigmf-meta` next to it holds the sample rate, centre frequency, UTC start time, gains, a SHA-512 of the data, and an annotation with the signal's estimated frequency edges and what it was identified as. SigMF-aware tools need nothing else; a tool that wants raw I/Q can read the `.sigmf-data` file as it is.
 
 ## Legal note
 

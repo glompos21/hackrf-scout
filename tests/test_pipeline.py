@@ -254,14 +254,21 @@ class CommandLine(unittest.TestCase):
         self.cli("run", "--db", self.db, "-f", "1:3000", "--scan-seconds", "30", "--cycles", "1",
                  "--capture-seconds", "1", "--capture-max", "2", "--capture-dir", cap, "--quiet", "--obs-interval", "2")
         files = sorted(os.listdir(cap))
-        self.assertEqual(len([f for f in files if f.endswith(".cs8")]), 2, files)
-        with open(os.path.join(cap, [f for f in files if f.endswith(".json")][0])) as fh:
+        data = [f for f in files if f.endswith(".sigmf-data")]
+        metas = [f for f in files if f.endswith(".sigmf-meta")]
+        self.assertEqual(len(data), 2, files)
+        self.assertEqual(len(metas), 2, files)
+        self.assertEqual(len(files), 4, files)  # a SigMF pair per capture, nothing else
+        with open(os.path.join(cap, metas[0])) as fh:
             meta = json.load(fh)
-        self.assertIn("center_hz", meta)
+        self.assertEqual(meta["global"]["core:datatype"], "ci8")
+        self.assertIn("core:frequency", meta["captures"][0])
         con = sqlite3.connect(self.db)
         self.assertEqual(con.execute("SELECT COUNT(*) FROM signals WHERE captured=1").fetchone()[0], 2)
         self.assertEqual(con.execute("SELECT COUNT(*) FROM captures").fetchone()[0], 2)
-        size = os.path.getsize(os.path.join(cap, [f for f in files if f.endswith(".cs8")][0]))
+        paths = [r[0] for r in con.execute("SELECT path FROM captures")]
+        self.assertTrue(all(p.endswith(".sigmf-data") and os.path.exists(p) for p in paths), paths)
+        size = os.path.getsize(os.path.join(cap, data[0]))
         self.assertGreaterEqual(size, 2_000_000)  # >= 1 s at 1 Msps... rate is at least 2 Msps
         con.close()
 
