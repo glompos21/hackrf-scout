@@ -1,0 +1,12 @@
+hackrf_scout.egg-info/
+data/
+<<<<<<< HEAD
+hackrf_scout/__pycache__
+=======
+hackrf_scout/__pycache__
+scout.db
+*.db
+*.db-shm
+*.db-wal
+captures/
+>>>>>>> 730115a (init)
