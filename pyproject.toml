@@ -10,8 +10,15 @@ readme = "README.md"
 requires-python = ">=3.9"
 dependencies = ["numpy>=1.21"]
 
+[project.optional-dependencies]
+web = ["fastapi>=0.100", "uvicorn>=0.23"]
+dev = ["httpx>=0.24"]  # fastapi.testclient, used by the web tests
+
 [project.scripts]
 hackrf-scout = "hackrf_scout.cli:main"
 
 [tool.setuptools]
 packages = ["hackrf_scout"]
+
+[tool.setuptools.package-data]
+hackrf_scout = ["static/*"]

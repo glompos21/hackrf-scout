@@ -1,0 +1,27 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<title>hackrf-scout</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Cpath d='M2 22h6l3-14 4 18 4-22 4 18h7' fill='none' stroke='%232f6fe4' stroke-width='3' stroke-linejoin='round' stroke-linecap='round'/%3E%3C/svg%3E">
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<a class="skip" href="#view">Skip to content</a>
+<header class="top">
+  <h1 class="brand">hackrf-scout</h1>
+  <nav class="tabs" aria-label="Sections">
+    <a href="#/live" data-tab="live">Live</a>
+    <a href="#/signals" data-tab="signals">Signals</a>
+    <a href="#/bands" data-tab="bands">Bands</a>
+    <a href="#/data" data-tab="data">Data</a>
+  </nav>
+  <div id="scanner-pill" class="pill" role="status">connecting&hellip;</div>
+</header>
+<main id="view" tabindex="-1"></main>
+<div id="toast" class="toast" role="status" aria-live="polite"></div>
+<script src="/static/app.js" defer></script>
+</body>
+</html>

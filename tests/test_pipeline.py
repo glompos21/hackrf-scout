@@ -46,6 +46,18 @@ class SweepParsing(unittest.TestCase):
             self.assertEqual(s.freqs.size, 1000)
             self.assertTrue(np.all(np.diff(s.freqs) > 0))
 
+    def test_narrow_scans_split_into_sweeps_too(self):
+        # a span under 30 MHz never "wraps"; the repeated chunks are what mark the next sweep
+        for a, b in ((863, 870), (433, 435)):
+            sweeps = list(iter_sweeps(simulate.generate(a, b, 100e3, 4, signals=[])))
+            self.assertEqual(len(sweeps), 4, (a, b))
+            self.assertTrue(all(s.freqs.size == sweeps[0].freqs.size for s in sweeps))
+
+    def test_narrow_scan_still_detects_signals(self):
+        with tempfile.TemporaryDirectory() as d:
+            _, rows = _scan_sim(os.path.join(d, "n.db"), sweeps=14, start=863.0, stop=870.0)
+        self.assertEqual([round(r["center_hz"] / 1e6) for r in rows], [868])
+
     def test_garbage_lines_ignored(self):
         lines = ["# comment\n", "not,a,csv\n", "\n"] + list(simulate.generate(100, 120, 100e3, 1, signals=[]))
         self.assertEqual(len(list(iter_sweeps(lines))), 1)
@@ -217,7 +229,8 @@ class CommandLine(unittest.TestCase):
             with open(p, "w") as fh:
                 fh.write(body)
             os.chmod(p, os.stat(p).st_mode | stat.S_IEXEC)
-        self.env = dict(os.environ, PATH=self.bin + os.pathsep + os.environ["PATH"], PYTHONPATH=ROOT)
+        self.env = dict(os.environ, PATH=self.bin + os.pathsep + os.environ["PATH"], PYTHONPATH=ROOT,
+                        HACKRF_SCOUT_STATE_DIR=os.path.join(self.tmp.name, "state"))
         self.db = os.path.join(self.tmp.name, "s.db")
 
     def tearDown(self):

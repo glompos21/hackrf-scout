@@ -3,15 +3,22 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import csv
 import json
+import os
+import re
+import shlex
+import signal
 import sys
 import time
 from datetime import datetime
-from typing import Iterator, List, Optional, Sequence, Tuple
+from typing import Callable, Iterator, List, Optional, Sequence, Tuple
 
 from . import __version__
+from . import bands as bandlib
 from .capture import capture_signal
+from .controller import HardwareLock
 from .identify import Identifier
 from .scanner import Scanner
 from .store import Store
@@ -64,88 +71,194 @@ def _identifier(args) -> Identifier:
     return Identifier.load(args.signals, region_keywords=tuple(DEFAULT_REGION_KEYWORDS) + tuple(extra), min_score=args.min_score)
 
 
-def _line_source(args, sweeps: Optional[int]):
-    """Returns (iterator_of_lines, closer, process_or_None)."""
+def _say(store: Store, msg: str, level: str = "info", source: str = "scan", quiet: bool = False, stdout: bool = False) -> None:
+    """Print to the console (unless quiet) and keep the line in the database log for the web UI."""
+    if not quiet:
+        print(msg, file=sys.stdout if stdout else sys.stderr)
+    store.log(msg, level=level, source=source)
+
+
+def _hackrf_log(store: Store) -> Callable[[str], None]:
+    """stderr of hackrf_sweep -> log table. It repeats a statistics line every second, so lines that
+    differ from the previous one only by digits are logged at most every 30 s."""
+    state = {"sig": None, "t": 0.0}
+
+    def on_line(line: str) -> None:
+        line = line.strip()
+        if not line:
+            return
+        sig = re.sub(r"[\d.]+", "#", line)
+        now = time.monotonic()
+        if sig == state["sig"] and now - state["t"] < 30:
+            return
+        state["sig"], state["t"] = sig, now
+        bad = re.search(r"fail|error|not found|denied|cannot|unable", line, re.I)
+        store.log(line, level="error" if bad else "info", source="hackrf_sweep")
+
+    return on_line
+
+
+@contextlib.contextmanager
+def _hardware(args, mode: str):
+    """Hold the single-owner HackRF lock and turn SIGINT/SIGTERM into a clean stop.
+
+    Replaying a saved sweep file (--source) needs no hardware, so it takes no lock.
+    """
+    def _stop(_sig, _frame):
+        raise KeyboardInterrupt
+
+    try:
+        signal.signal(signal.SIGINT, signal.default_int_handler)  # a background launch may have left it ignored
+        signal.signal(signal.SIGTERM, _stop)
+    except ValueError:  # not the main thread
+        pass
+    if getattr(args, "source", None):
+        yield None
+        return
+    with HardwareLock().acquire(mode=mode, db=os.path.abspath(args.db), argv=sys.argv[1:], phase="scanning") as lock:
+        yield lock
+
+
+def _sweep_ranges(values: Sequence[str]) -> List[str]:
+    """`-f` values: START:STOP in whole MHz pass through; anything else must be a band name or range."""
+    registry = bandlib.Registry(bandlib.load_custom(bandlib.default_bands_path())[0])
+    out = []
+    for v in values:
+        if re.match(r"^\d+:\d+$", v):
+            out.append(v)
+            continue
+        try:
+            out.append(registry.resolve(v).sweep_range())
+        except ValueError as exc:
+            raise RuntimeError(str(exc))
+    return out
+
+
+def _line_source(args, sweeps: Optional[int], store: Optional[Store] = None):
+    """Returns (iterator_of_lines, closer, process_or_None, description)."""
     src = getattr(args, "source", None)
     if src:
         if src == "-":
-            return iter(sys.stdin), (lambda: None), None
+            return iter(sys.stdin), (lambda: None), None, "replaying sweep data from stdin"
         fh = open(src, "r", encoding="utf-8", errors="replace")
-        return iter(fh), fh.close, None
-    ranges = args.freq or ["1:6000"]
+        return iter(fh), fh.close, None, f"replaying sweep data from {src}"
+    ranges = _sweep_ranges(args.freq or ["1:6000"])
     cmd = build_sweep_command(args.hackrf_sweep, ranges, args.bin_width, args.lna, args.vga, args.amp, sweeps)
-    proc = SweepProcess(cmd)
-    return proc.lines(), proc.close, proc
+    proc = SweepProcess(cmd, on_stderr=_hackrf_log(store) if store is not None else None)
+    return proc.lines(), proc.close, proc, "started " + shlex.join(cmd)
 
 
-def do_scan(args, store: Store, scanner: Scanner, duration: Optional[float], sweeps: Optional[int], quiet: bool) -> int:
-    lines, close, proc = _line_source(args, sweeps)
+def _signal_logger(store: Store) -> Callable[[str], None]:
+    def log(msg: str) -> None:
+        print(msg)
+        store.log(msg, source="signal")
+
+    return log
+
+
+def do_scan(args, store: Store, scanner: Scanner, duration: Optional[float], sweeps: Optional[int], quiet: bool) -> Tuple[int, bool]:
+    """Returns (sweeps processed, interrupted). A negative count means no data arrived at all."""
+    lines, close, proc, what = _line_source(args, sweeps, store)
+    _say(store, what, quiet=quiet)
+    store.commit()
     t_end = time.monotonic() + duration if duration else None
     n = 0
+    interrupted = False
+    last_progress = time.monotonic()
     try:
         for sweep in iter_sweeps(lines):
             res = scanner.process(sweep)
             n += 1
-            if not quiet and n % 10 == 0:
-                print(
+            if n % 10 == 0 or time.monotonic() - last_progress >= 15:
+                last_progress = time.monotonic()
+                _say(
+                    store,
                     f"  sweep {res['sweep']}: {res['detections']} detections, floor {res['floor_db']:.1f} dB, "
                     f"{sum(1 for t in scanner.tracks if t.id is not None)} signals stored",
-                    file=sys.stderr,
+                    quiet=quiet,
                 )
             if (t_end and time.monotonic() >= t_end) or (sweeps and n >= sweeps):
                 break
     except KeyboardInterrupt:
-        print("\nStopping ...", file=sys.stderr)
+        interrupted = True
+        _say(store, "Stopping ...")
     finally:
         rc = 0
         close_result = close()
         if proc is not None:
             rc = close_result if isinstance(close_result, int) else 0
         store.commit()
-    if proc is not None and n == 0:
-        print("No sweep data received from hackrf_sweep.", file=sys.stderr)
+    if proc is not None and n == 0 and not interrupted:
+        _say(store, "No sweep data received from hackrf_sweep.", level="error")
         tail = proc.error_text()
         if tail:
-            print(tail, file=sys.stderr)
-        print("Check: `hackrf_info` shows your HackRF, USB permissions (udev rules / sudo), no other app using it.", file=sys.stderr)
-        return -1
-    return n
+            _say(store, tail, level="error", source="hackrf_sweep")
+        _say(store, "Check: `hackrf_info` shows your HackRF, USB permissions (udev rules / sudo), no other app using it.", level="warn")
+        store.commit()
+        return -1, interrupted
+    _say(store, f"scan ended after {n} sweeps", quiet=True)
+    store.commit()
+    return n, interrupted
 
 
 # ---------------------------------------------------------------- commands
 def cmd_scan(args) -> int:
-    store = Store(args.db)
-    ident = _identifier(args)
-    if not ident.has_database:
-        print("Note: no Artemis database found - using the built-in bandplan only. Run `hackrf-scout update-db` once.", file=sys.stderr)
-    scanner = Scanner(store, ident, args.snr, args.min_hits, args.expire, args.obs_interval, _ranges(args.ignore))
-    n = do_scan(args, store, scanner, args.duration, args.sweeps, args.quiet)
-    if n < 0:
-        return 2
-    total = len(store.load_signals())
-    print(f"Done: {n} sweeps processed, {len(scanner.new_signals)} new signals, {total} stored in {args.db}")
-    store.close()
-    return 0
+    with _hardware(args, "scan"):
+        store = Store(args.db)
+        try:
+            ident = _identifier(args)
+            if not ident.has_database:
+                _say(store, "Note: no Artemis database found - using the built-in bandplan only. Run `hackrf-scout update-db` once.", level="warn")
+            scanner = Scanner(store, ident, args.snr, args.min_hits, args.expire, args.obs_interval, _ranges(args.ignore),
+                              log=_signal_logger(store))
+            n, _ = do_scan(args, store, scanner, args.duration, args.sweeps, args.quiet)
+            if n < 0:
+                return 2
+            total = len(store.load_signals())
+            msg = f"Done: {n} sweeps processed, {len(scanner.new_signals)} new signals, {total} stored in {args.db}"
+            print(msg)
+            store.log(msg, source="scan")
+            return 0
+        except RuntimeError as exc:
+            store.log(f"error: {exc}", level="error")
+            raise
+        finally:
+            store.close()
 
 
 def cmd_run(args) -> int:
-    store = Store(args.db)
-    ident = _identifier(args)
-    scanner = Scanner(store, ident, args.snr, args.min_hits, args.expire, args.obs_interval, _ranges(args.ignore))
-    cycle = 0
-    try:
-        while args.cycles == 0 or cycle < args.cycles:
-            cycle += 1
-            print(f"[cycle {cycle}] scanning for {args.scan_seconds:.0f} s ...", file=sys.stderr)
-            n = do_scan(args, store, scanner, args.scan_seconds, None, args.quiet)
-            if n < 0:
-                return 2
-            if args.capture_seconds > 0:
-                _do_captures(args, store, ident, args.capture_max, args.capture_which)
-    except KeyboardInterrupt:
-        print("\nStopped.", file=sys.stderr)
-    store.close()
-    return 0
+    with _hardware(args, "run") as lock:
+        store = Store(args.db)
+        try:
+            ident = _identifier(args)
+            scanner = Scanner(store, ident, args.snr, args.min_hits, args.expire, args.obs_interval, _ranges(args.ignore),
+                              log=_signal_logger(store))
+            cycle = 0
+            try:
+                while args.cycles == 0 or cycle < args.cycles:
+                    cycle += 1
+                    _say(store, f"[cycle {cycle}] scanning for {args.scan_seconds:.0f} s ...")
+                    n, interrupted = do_scan(args, store, scanner, args.scan_seconds, None, args.quiet)
+                    if n < 0:
+                        return 2
+                    if interrupted:
+                        raise KeyboardInterrupt  # a stop request ends the whole run, not just this cycle
+                    if args.capture_seconds > 0:
+                        if lock is not None:
+                            lock.update(phase="capturing")
+                        try:
+                            _do_captures(args, store, ident, args.capture_max, args.capture_which)
+                        finally:
+                            if lock is not None:
+                                lock.update(phase="scanning")
+            except KeyboardInterrupt:
+                _say(store, "Stopped.")
+            return 0
+        except RuntimeError as exc:
+            store.log(f"error: {exc}", level="error")
+            raise
+        finally:
+            store.close()
 
 
 def _do_captures(args, store: Store, ident: Identifier, limit: int, which: str) -> int:
@@ -158,22 +271,26 @@ def _do_captures(args, store: Store, ident: Identifier, limit: int, which: str) 
         try:
             info = capture_signal(r, args.capture_dir, args.capture_seconds, args.lna, args.vga, args.amp, args.hackrf_transfer)
         except RuntimeError as exc:
-            print(f"  capture of #{r['id']} failed: {exc}", file=sys.stderr)
+            _say(store, f"  capture of #{r['id']} failed: {exc}", level="warn", source="capture")
             continue
         store.add_capture(r["id"], datetime.now().isoformat(timespec="seconds"), info["path"], info["center_hz"], info["rate"], info["seconds"])
         store.mark_captured(r["id"])
         store.commit()
-        print(f"  captured #{r['id']} {r['center_hz'] / 1e6:.3f} MHz -> {info['path']}")
+        _say(store, f"  captured #{r['id']} {r['center_hz'] / 1e6:.3f} MHz -> {info['path']}", source="capture", stdout=True)
+        store.commit()
         done += 1
     return done
 
 
 def cmd_capture(args) -> int:
-    store = Store(args.db)
-    n = _do_captures(args, store, _identifier(args), args.top, args.which)
-    print(f"{n} capture(s) written to {args.capture_dir}")
-    store.close()
-    return 0
+    with _hardware(args, "capture"):
+        store = Store(args.db)
+        try:
+            n = _do_captures(args, store, _identifier(args), args.top, args.which)
+            _say(store, f"{n} capture(s) written to {args.capture_dir}", source="capture", stdout=True)
+            return 0
+        finally:
+            store.close()
 
 
 def cmd_identify(args) -> int:
@@ -198,8 +315,11 @@ def cmd_report(args) -> int:
     store = Store(args.db)
     band = None
     if args.band:
-        a, b = args.band.split(":")
-        band = (float(a) * 1e6, float(b) * 1e6)
+        try:
+            b = bandlib.Registry(bandlib.load_custom(bandlib.default_bands_path())[0]).resolve(args.band)
+        except ValueError as exc:
+            raise RuntimeError(str(exc))
+        band = (b.lo_hz, b.hi_hz)
     rows = store.query_signals(args.unidentified, args.min_hits, args.sort, args.limit, band)
     sweeps = store.sweep_count()
     if not rows:
@@ -256,6 +376,14 @@ def cmd_update_db(args) -> int:
 
     artemisdb.update(args.dest)
     return 0
+
+
+def cmd_web(args) -> int:
+    try:
+        from . import webapp
+    except ImportError as exc:
+        raise RuntimeError(f"the web interface needs extra packages: pip install 'hackrf-scout[web]' ({exc})")
+    return webapp.serve(args)
 
 
 def cmd_simulate(args) -> int:
@@ -326,7 +454,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--unidentified", action="store_true", help="only signals with no identification at all")
     p.add_argument("--min-hits", type=int, default=0)
     p.add_argument("--sort", default="center_hz", help="center_hz, hits, max_snr, last_seen, first_seen, bandwidth_hz, max_db")
-    p.add_argument("--band", metavar="START:STOP", help="only this MHz range")
+    p.add_argument("--band", metavar="NAME|START:STOP", help="only this band: a preset such as 868, 433, 2.4ghz, or a MHz range")
     p.add_argument("--limit", type=int)
     p.add_argument("-v", "--verbose", action="store_true", help="show top candidate matches")
     p.set_defaults(fn=cmd_report)
@@ -341,6 +469,19 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("update-db", help="download the Artemis/SigID signal database (once, ~300 MB)")
     p.add_argument("--dest", default="data")
     p.set_defaults(fn=cmd_update_db)
+
+    p = sub.add_parser("web", help="browser interface: live log, signal database, band filters, start/stop")
+    common(p)
+    p.add_argument("--host", default="127.0.0.1", help="address to listen on (default 127.0.0.1; anything else needs --token)")
+    p.add_argument("--port", type=int, default=8765)
+    p.add_argument("--token", help="require this bearer token for the API (or set HACKRF_SCOUT_TOKEN)")
+    p.add_argument("--allow-control", action="store_true", help="let the browser start and stop the scanner (generates a token if none is given)")
+    p.add_argument("--allowed-host", action="append", metavar="NAME", help="extra Host header value to accept (repeatable)")
+    p.add_argument("--bands-file", help="JSON file with extra band presets (default ~/.hackrf-scout/bands.json)")
+    p.add_argument("--capture-dir", default="captures", help="where scans started from the browser store IQ captures")
+    p.add_argument("--hackrf-sweep", help="path to hackrf_sweep for scans started from the browser")
+    p.add_argument("--hackrf-transfer", help="path to hackrf_transfer for scans started from the browser")
+    p.set_defaults(fn=cmd_web)
 
     p = sub.add_parser("simulate", help="print simulated hackrf_sweep output (for testing without hardware)")
     p.add_argument("rest", nargs=argparse.REMAINDER)
@@ -360,6 +501,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     except RuntimeError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
+    except KeyboardInterrupt:
+        return 130
 
 
 if __name__ == "__main__":

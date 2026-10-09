@@ -2,9 +2,14 @@
 
 from __future__ import annotations
 
+import collections
 import json
 import sqlite3
+from datetime import datetime
 from typing import Any, Dict, Iterable, List, Optional
+
+LOG_KEEP = 5000  # newest log rows kept in the table
+LOG_PRUNE_EVERY = 250  # inserts between prune passes
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT);
@@ -42,6 +47,13 @@ CREATE TABLE IF NOT EXISTS captures(
   ts TEXT NOT NULL, path TEXT NOT NULL,
   center_hz REAL, sample_rate REAL, seconds REAL
 );
+CREATE TABLE IF NOT EXISTS log(
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  ts TEXT NOT NULL,
+  level TEXT NOT NULL,
+  source TEXT NOT NULL,
+  msg TEXT NOT NULL
+);
 """
 
 
@@ -54,10 +66,33 @@ class Store:
         self.conn.execute("PRAGMA foreign_keys=ON")
         self.conn.executescript(SCHEMA)
         self.conn.commit()
+        self._log_buf: collections.deque = collections.deque()
+        self._log_inserts = 0
 
     def close(self) -> None:
-        self.conn.commit()
+        self.commit()
         self.conn.close()
+
+    # ---- log -----------------------------------------------------------
+    def log(self, msg: str, level: str = "info", source: str = "scout") -> None:
+        """Queue a log line for the web UI. Safe to call from any thread: nothing touches the
+        connection until the owning thread calls commit(), so it never joins a half-built transaction."""
+        self._log_buf.append((datetime.now().isoformat(timespec="milliseconds"), level, source, str(msg)[:2000]))
+
+    def flush_log(self) -> None:
+        n = 0
+        while True:
+            try:
+                row = self._log_buf.popleft()
+            except IndexError:
+                break
+            self.conn.execute("INSERT INTO log(ts,level,source,msg) VALUES(?,?,?,?)", row)
+            n += 1
+        if n:
+            self._log_inserts += n
+            if self._log_inserts >= LOG_PRUNE_EVERY:
+                self._log_inserts = 0
+                self.conn.execute("DELETE FROM log WHERE id <= (SELECT MAX(id) FROM log) - ?", (LOG_KEEP,))
 
     # ---- meta / sweeps -------------------------------------------------
     def bump_sweep(self) -> int:
@@ -160,4 +195,5 @@ class Store:
         return self.conn.execute("SELECT * FROM observations WHERE signal_id=? ORDER BY ts", (signal_id,)).fetchall()
 
     def commit(self) -> None:
+        self.flush_log()
         self.conn.commit()
