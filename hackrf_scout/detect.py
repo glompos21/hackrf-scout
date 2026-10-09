@@ -9,13 +9,16 @@ Method
    regions where two peaks are separated by a deep valley (`valley_db`).
 4. For each region report centre, occupied bandwidth, peak power and SNR.
 
+`FloorTracker` smooths that floor over successive sweeps and notices sudden jumps,
+which usually mean a strong transmitter is overloading the receiver.
+
 Powers are the relative dB values printed by hackrf_sweep (not calibrated dBm).
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import List, Sequence, Tuple
+from typing import List, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -69,6 +72,64 @@ def estimate_floor(power: np.ndarray, bin_hz: float, coarse_block_hz: float = 50
     return np.interp(np.arange(n), fx, fv)
 
 
+class FloorTracker:
+    """Smooths the per-bin noise floor over sweeps and flags sudden jumps.
+
+    One sweep's floor estimate wobbles by a dB or so, which moves signals back and forth across the
+    SNR threshold. An exponential moving average (in dB, per frequency) steadies it: each new sweep
+    counts for `alpha` (1 = no smoothing).
+
+    A jump of more than `jump_db` in the median floor is a different matter. Brief ones usually mean
+    a strong transmitter is overloading the receiver (the whole floor rises and ghost signals appear),
+    so `update` reports them as suspect and keeps the old floor. If the new level holds for
+    `max_suspect` sweeps in a row it is real (new antenna, new gain) and becomes the baseline.
+    """
+
+    def __init__(self, alpha: float = 0.2, jump_db: float = 6.0, max_suspect: int = 3):
+        if not 0.0 < alpha <= 1.0:
+            raise ValueError("alpha must be in (0, 1]")
+        self.alpha = alpha
+        self.jump_db = jump_db
+        self.max_suspect = max(1, max_suspect)
+        self._freqs: Optional[np.ndarray] = None
+        self._floor: Optional[np.ndarray] = None
+        self._suspect = 0
+        self.accepted_jump: Optional[float] = None  # set on the sweep where a persistent jump became the new baseline
+
+    def _previous_on(self, freqs: np.ndarray) -> Optional[np.ndarray]:
+        """The smoothed floor re-sampled onto this sweep's frequencies (None if the ranges barely overlap)."""
+        if self._freqs is None or self._floor is None:
+            return None
+        if self._freqs.size == freqs.size and np.allclose(self._freqs, freqs, rtol=0.0, atol=1.0):
+            return self._floor
+        lo, hi = float(freqs[0]), float(freqs[-1])
+        overlap = min(hi, self._freqs[-1]) - max(lo, self._freqs[0])
+        if overlap < 0.5 * (hi - lo):
+            return None
+        return np.interp(freqs, self._freqs, self._floor)
+
+    def update(self, freqs: np.ndarray, raw: np.ndarray) -> Tuple[np.ndarray, Optional[float]]:
+        """Returns (floor to use, jump_db). `jump_db` is None normally, or the size of a suspect jump,
+        in which case the caller should skip this sweep."""
+        self.accepted_jump = None
+        prev = self._previous_on(freqs)
+        if prev is None:
+            self._freqs, self._floor, self._suspect = freqs.copy(), raw.copy(), 0
+            return raw, None
+        jump = float(np.median(raw - prev))
+        if self.jump_db > 0 and abs(jump) > self.jump_db:
+            self._suspect += 1
+            if self._suspect < self.max_suspect:
+                return prev, jump
+            self._freqs, self._floor, self._suspect = freqs.copy(), raw.copy(), 0  # it stayed: take it as the new normal
+            self.accepted_jump = jump
+            return raw, None
+        self._suspect = 0
+        smoothed = self.alpha * raw + (1.0 - self.alpha) * prev
+        self._freqs, self._floor = freqs.copy(), smoothed
+        return smoothed, None
+
+
 def _split_on_valleys(p: np.ndarray, valley_db: float) -> List[int]:
     """Return indices (relative to p) of valley minima where a region should be cut."""
     cuts: List[int] = []
@@ -101,11 +162,15 @@ def detect_signals(
     merge_gap_bins: int = 1,
     valley_db: float = 10.0,
     ignore: Sequence[Tuple[float, float]] = (),
+    floor: Optional[np.ndarray] = None,
 ) -> Tuple[List[Detection], float]:
-    """Detect signals in a sweep. Returns (detections, median_floor_db)."""
+    """Detect signals in a sweep. Returns (detections, median_floor_db).
+
+    `floor` is the per-bin noise floor; it is estimated from this sweep when not given."""
     if power.size == 0:
         return [], float("nan")
-    floor = estimate_floor(power, bin_hz)
+    if floor is None:
+        floor = estimate_floor(power, bin_hz)
     work = power.copy()
     for lo, hi in ignore:
         work[(freqs >= lo) & (freqs <= hi)] = floor[(freqs >= lo) & (freqs <= hi)]

@@ -38,6 +38,7 @@ hackrf-scout report                     # everything
 hackrf-scout report --unidentified -v   # the interesting ones, with candidate matches
 hackrf-scout report --band 430:440 --sort max_snr
 hackrf-scout report --band 868          # a band name works anywhere a range does
+hackrf-scout anomalies                  # signals that are louder, quieter, gone quiet or new compared with their own baseline
 hackrf-scout export --format csv > signals.csv
 hackrf-scout export --format json --observations > signals.json
 
@@ -70,7 +71,7 @@ Run it on the machine that has the HackRF and `scout.db` (SQLite's WAL mode does
 | **Live** | Scanner status, counters, and the **live log**: new signals, sweep progress, the output of `hackrf_sweep`, errors. With `--allow-control` it also has the start/stop form. |
 | **Signals** | Every stored signal, filtered by band, identification, hits, SNR or text; sortable and paged. Click a row for candidates, bands, signal-strength history and observations. CSV/JSON export of the current filter. |
 | **Bands** | One row per band (433, 868, 2.4 GHz, ...): signal count, unidentified count, best SNR, activity over time, and the `scan -f` command that revisits only that band. |
-| **Data** | Read-only view of every table in the database (`signals`, `observations`, `sweeps`, `captures`, `log`, `meta`). |
+| **Data** | Read-only view of every table in the database (`signals`, `observations`, `sweeps`, `captures`, `scans`, `log`, `meta`). |
 
 ### Bands
 
@@ -102,7 +103,36 @@ When you scan, `hackrf_sweep` needs whole MHz, so a band is rounded outwards (43
 
 ### API
 
-JSON under `/api` (all `GET` unless noted): `status`, `signals` (`band`, `mode`, `unidentified`, `min_hits`, `min_snr`, `q`, `sort`, `order`, `page`, `page_size`), `signals/{id}`, `signals/export?format=csv|json`, `observations`, `sweeps`, `captures`, `bands`, `bands/summary`, `bands/activity`, `tables`, `tables/{name}`, `log?tail=N|after=ID`, `log/stream` (server-sent events, resumes with `Last-Event-ID`), `scanner`, and `POST scanner/start|stop|check` (only with `--allow-control`).
+JSON under `/api` (all `GET` unless noted): `status`, `anomalies`, `signals` (`band`, `mode`, `unidentified`, `flagged`, `min_hits`, `min_snr`, `q`, `sort`, `order`, `page`, `page_size`), `signals/{id}`, `signals/export?format=csv|json`, `observations`, `sweeps`, `captures`, `bands`, `bands/summary`, `bands/activity`, `tables`, `tables/{name}`, `log?tail=N|after=ID`, `log/stream` (server-sent events, resumes with `Last-Event-ID`), `scanner`, and `POST scanner/start|stop|check` (only with `--allow-control`).
+
+## Steadier detection
+
+Three things keep a signal from flickering in and out, and keep a bad sweep from creating ghosts. All are on by default and have a switch:
+
+| What | Default | How it works |
+|---|---|---|
+| **Smoothed noise floor** (`--floor-alpha`) | 0.2 | Each sweep's floor estimate wobbles by a dB or so, which moves signals across the SNR threshold. The floor is averaged over sweeps, per frequency (1 = off). |
+| **Hysteresis** (`--hysteresis`) | 3 dB | A new signal must reach `--snr`, but a *confirmed* one stays detected down to `--snr` minus this, so a signal hovering at the threshold keeps its hit count. Weak detections can only continue a confirmed signal, never start one. |
+| **Overload guard** (`--overload-db`) | 6 dB | `hackrf_sweep` cannot report clipping, so the guard looks for its symptoms: the whole noise floor jumping by more than this, or a flood of detections (over 30 and 4x the recent median). Such a sweep is skipped, with a warning in the log. If it lasts three sweeps in a row it is taken as the new normal (new antenna, new gain). 0 turns the guard off. |
+
+## Baselines and alerts
+
+Compared with *its own* history, is a signal behaving? Everything is computed from data already stored (`observations` and the new `scans` table), so it works while a scan runs, in the web UI and from the command line:
+
+```bash
+hackrf-scout anomalies [--kind louder] [--json]
+```
+
+| Flag | Meaning |
+|---|---|
+| `louder` / `quieter` | The median SNR of the last 5 observations is well away from the signal's baseline (the median of its older observations, with a robust spread). The shift must be at least 3 robust standard deviations and at least 3 dB, and the spread is never trusted below 1.5 dB (so in practice about 4.5 dB), which keeps small wobbles from counting. The median of five makes one blip harmless. Needs 13 observations first. |
+| `gone_quiet` | A signal that normally appears at least every few minutes has not been seen for 5 times its longest usual gap (and at least 5 minutes) **of scanning that frequency**. |
+| `new_in_quiet` | First seen in the last hour, where nothing else had ever been seen within 1 MHz (or its own bandwidth), and that frequency had been scanned for at least 30 minutes before that. |
+
+* **"Scanned" matters.** Each scan records its frequency ranges (`scans` table). Scanning a different band does not make everything look silent or new, and stopping the scanner does not make everything "gone quiet": the judgements are made as of the last moment the scanner was looking. The age is shown next to the alerts.
+* SNR (against the local noise floor) is compared, not raw power, so a gain change between sessions is not mistaken for a signal change.
+* While a scan runs, each new flag is written to the log once a minute at most (`ALERT ...` / `notice ...`). In the web UI they show on the Live tab, as badges in the Signals table (with a "Flagged only" filter) and in each signal's detail.
+* Thresholds are in `hackrf_scout/baseline.py` (`BaselineConfig`). They are reasonable starting points, not tuned on real captures; expect to adjust them for your site.
 
 ## How identification works
 
@@ -121,6 +151,8 @@ Treat names as leads, not facts. Many consumer devices (key fobs, sensors) share
 | Missing weak signals | lower `--snr` (7–8), add `-a`, or scan narrower ranges so each sweep is faster |
 | Overload / ghost signals near strong transmitters | lower `-l`/`-g`, leave `-a` off, use `--ignore` for known spurs |
 | Short bursts (LoRa, remotes, TPMS) missed | sweeps are about 1–3 s over the whole range; scan only the relevant bands (`-f 433:435`) for much faster revisits |
+| A real signal keeps dropping out at the threshold | `--hysteresis 4` (or higher), or a slightly lower `--snr` |
+| "sweep skipped, possible receiver overload" in the log | A strong transmitter is overloading the front end: lower `-l`/`-g`, turn `-a` off, move the antenna. If the new level is real, the guard accepts it after 3 sweeps; `--overload-db 0` turns it off |
 | Frequency resolution | `-w 100000` is the default; smaller bins resolve narrow signals better but slow the sweep |
 
 ## Limits
@@ -133,7 +165,7 @@ Treat names as leads, not facts. Many consumer devices (key fobs, sensors) share
 
 ## Files
 
-* `scout.db`: SQLite with tables `signals`, `observations`, `sweeps`, `captures`, `log` (the last 5000 log lines, shown in the web UI), `meta`.
+* `scout.db`: SQLite with tables `signals`, `observations`, `sweeps`, `captures`, `scans` (one row per scan session with its frequency ranges, used by the baselines), `log` (the last 5000 log lines, shown in the web UI), `meta`.
 * `~/.hackrf-scout/`: `scanner.lock` and `scanner.json` (who is using the HackRF), `scanner.out` (console output of a scan started from the browser), optional `bands.json`. Override the folder with `HACKRF_SCOUT_STATE_DIR`.
 * `captures/`: `sigNNNN_<freq>MHz_<time>.cs8` (signed 8-bit interleaved IQ) plus a `.json` sidecar with centre frequency, sample rate and gains.
 

@@ -152,7 +152,7 @@ class HardwareLock:
 # --------------------------------------------------------------------------- argument building
 _REGION = re.compile(r"^[A-Za-z0-9 ,._-]{0,100}$")
 _SCAN_KEYS = {"mode", "bands", "lna", "vga", "amp", "bin_width", "snr", "min_hits", "expire", "obs_interval",
-              "region_keywords", "duration"}
+              "region_keywords", "duration", "floor_alpha", "hysteresis", "overload_db"}
 _RUN_KEYS = {"scan_seconds", "cycles", "capture_seconds", "capture_max", "capture_which", "capture_min_snr"}
 
 
@@ -224,6 +224,9 @@ def build_scan_args(
     argv += ["--min-hits", str(_num(params, "min_hits", 3, 1, 50, integer=True))]
     argv += ["--expire", str(_num(params, "expire", 20, 1, 1000, integer=True))]
     argv += ["--obs-interval", f"{_num(params, 'obs_interval', 30.0, 1, 3600):g}"]
+    argv += ["--floor-alpha", f"{_num(params, 'floor_alpha', 0.2, 0.001, 1):g}"]
+    argv += ["--hysteresis", f"{_num(params, 'hysteresis', 3.0, 0, 30):g}"]
+    argv += ["--overload-db", f"{_num(params, 'overload_db', 6.0, 0, 60):g}"]
     region = params.get("region_keywords", "")
     if not isinstance(region, str) or not _REGION.match(region):
         raise ValueError("region_keywords may only contain letters, digits, spaces and , . _ -")

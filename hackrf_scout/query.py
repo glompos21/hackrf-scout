@@ -13,14 +13,17 @@ import json
 import math
 import os
 import sqlite3
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional, Sequence
 
 from . import bandplan
 from . import bands as bandlib
+from . import baseline
 
-TABLES = ("signals", "observations", "sweeps", "captures", "log", "meta")
+TABLES = ("signals", "observations", "sweeps", "captures", "scans", "log", "meta")
 MAX_PAGE_SIZE = 500
+MAX_ID_FILTER = 500  # most flagged signals one list request will filter on
 
 SIGNAL_SORTS = {
     "id", "center_hz", "bandwidth_hz", "first_seen", "last_seen", "hits", "max_db", "max_snr", "last_snr",
@@ -108,6 +111,7 @@ def signal_where(
     min_snr: Optional[float] = None,
     q: Optional[str] = None,
     captured: Optional[bool] = None,
+    ids: Optional[Sequence[int]] = None,
 ) -> tuple:
     clause, params = bandlib.signal_clause(bands, mode, _margin(conn) if bands else 0.0)
     where = [clause, "s.hits >= ?"]
@@ -120,6 +124,10 @@ def signal_where(
     if captured is not None:
         where.append("s.captured = ?")
         params.append(1 if captured else 0)
+    if ids is not None:
+        ids = [int(i) for i in ids][:MAX_ID_FILTER]
+        where.append("s.id IN (" + ",".join("?" * len(ids)) + ")" if ids else "0")
+        params += ids
     if q and q.strip():
         text = q.strip()[:80]
         like = _like(text)
@@ -176,7 +184,10 @@ def list_signals(
     order: Optional[str] = None,
     page: int = 1,
     page_size: int = 50,
+    ids: Optional[Sequence[int]] = None,
+    flags: Optional[Dict[int, List[str]]] = None,
 ) -> Dict[str, Any]:
+    """`ids` limits the list to those signals; `flags` ({signal id: [kinds]}) is attached to each item."""
     if sort not in SIGNAL_SORTS:
         raise ValueError(f"sort must be one of {sorted(SIGNAL_SORTS)}")
     if order is None:
@@ -184,15 +195,18 @@ def list_signals(
     if order not in ("asc", "desc"):
         raise ValueError("order must be asc or desc")
     page, page_size, offset = _page(page, page_size)
-    where, params = signal_where(conn, bands, mode, unidentified, min_hits, min_snr, q, captured)
+    where, params = signal_where(conn, bands, mode, unidentified, min_hits, min_snr, q, captured, ids)
     total = conn.execute(f"SELECT COUNT(*) FROM signals s WHERE {where}", params).fetchone()[0]
     rows = conn.execute(
         f"SELECT s.* FROM signals s WHERE {where} ORDER BY s.{sort} {order.upper()}, s.id ASC LIMIT ? OFFSET ?",
         params + [page_size, offset],
     ).fetchall()
     sweeps = _meta_int(conn, "sweep_count")
-    return {"total": total, "page": page, "page_size": page_size, "sort": sort, "order": order,
-            "items": [_signal_item(r, sweeps) for r in rows]}
+    items = [_signal_item(r, sweeps) for r in rows]
+    if flags is not None:
+        for it in items:
+            it["flags"] = flags.get(it["id"], [])
+    return {"total": total, "page": page, "page_size": page_size, "sort": sort, "order": order, "items": items}
 
 
 def signal_detail(conn: sqlite3.Connection, signal_id: int, registry: bandlib.Registry, obs_limit: int = 300) -> Optional[Dict[str, Any]]:
@@ -215,6 +229,7 @@ def signal_detail(conn: sqlite3.Connection, signal_id: int, registry: bandlib.Re
     obs = conn.execute("SELECT * FROM observations WHERE signal_id=? ORDER BY ts DESC, id DESC LIMIT ?", (signal_id, obs_limit)).fetchall()
     d["observations"] = [_row(o) for o in obs]
     d["captures"] = [_row(c) for c in conn.execute("SELECT * FROM captures WHERE signal_id=? ORDER BY ts DESC", (signal_id,)).fetchall()]
+    d["baseline"] = baseline.signal_baseline(conn, signal_id)
     return d
 
 
@@ -294,6 +309,22 @@ def list_sweeps(conn: sqlite3.Connection, page: int = 1, page_size: int = 100) -
 
 def list_captures(conn: sqlite3.Connection, page: int = 1, page_size: int = 100) -> Dict[str, Any]:
     return _simple_list(conn, "captures", page, page_size)
+
+
+# ---------------------------------------------------------------------------------- anomalies
+def anomalies(conn: sqlite3.Connection, kinds: Optional[Sequence[str]] = None) -> Dict[str, Any]:
+    """Baseline flags, plus how old the data they are based on is."""
+    res = baseline.evaluate(conn, kinds=kinds)
+    ref = baseline.parse_ts(res["ref"]) if res["ref"] else None
+    res["age_s"] = max(0, round((datetime.now() - ref).total_seconds())) if ref else None
+    return res
+
+
+def flag_map(result: Dict[str, Any]) -> Dict[int, List[str]]:
+    out: Dict[int, List[str]] = {}
+    for f in result["flags"]:
+        out.setdefault(f["signal_id"], []).append(f["kind"])
+    return out
 
 
 # ---------------------------------------------------------------------------------- bands

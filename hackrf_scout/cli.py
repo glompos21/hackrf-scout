@@ -10,6 +10,7 @@ import os
 import re
 import shlex
 import signal
+import sqlite3
 import sys
 import time
 from datetime import datetime
@@ -17,6 +18,7 @@ from typing import Callable, Iterator, List, Optional, Sequence, Tuple
 
 from . import __version__
 from . import bands as bandlib
+from . import baseline
 from .capture import capture_signal
 from .controller import HardwareLock
 from .identify import Identifier
@@ -58,6 +60,9 @@ def _add_scan_args(p: argparse.ArgumentParser) -> None:
     d.add_argument("--expire", type=int, default=20, help="drop unconfirmed candidates after this many sweeps without a hit")
     d.add_argument("--ignore", action="append", metavar="START:STOP", help="MHz range to ignore (repeatable), e.g. known spurs")
     d.add_argument("--obs-interval", type=float, default=30.0, help="seconds between stored observations per signal (default 30)")
+    d.add_argument("--floor-alpha", type=float, default=0.2, help="weight of the newest sweep in the smoothed noise floor, 0-1 (default 0.2; 1 = no smoothing)")
+    d.add_argument("--hysteresis", type=float, default=3.0, help="a confirmed signal stays detected down to SNR minus this many dB (default 3; 0 = off)")
+    d.add_argument("--overload-db", type=float, default=6.0, help="skip sweeps whose noise floor jumps by more than this many dB, usually receiver overload (default 6; 0 = off)")
     i = p.add_argument_group("identification")
     i.add_argument("--signals", help="path to artemis_signals.json (see update-db)")
     i.add_argument("--region-keywords", default="", help="extra comma-separated region words, e.g. greece,cyprus")
@@ -148,6 +153,69 @@ def _line_source(args, sweeps: Optional[int], store: Optional[Store] = None):
     return proc.lines(), proc.close, proc, "started " + shlex.join(cmd)
 
 
+def _warn_logger(store: Store) -> Callable[[str], None]:
+    def warn(msg: str) -> None:
+        print("warning: " + msg, file=sys.stderr)
+        store.log(msg, level="warn", source="detect")
+
+    return warn
+
+
+def _scanner(args, store: Store, ident: Identifier) -> Scanner:
+    for name, lo, hi in (("--floor-alpha", args.floor_alpha, (0.001, 1.0)), ("--hysteresis", args.hysteresis, (0.0, 30.0)), ("--overload-db", args.overload_db, (0.0, 60.0))):
+        if not hi[0] <= lo <= hi[1]:
+            raise RuntimeError(f"{name} must be between {hi[0]:g} and {hi[1]:g}")
+    return Scanner(
+        store, ident, args.snr, args.min_hits, args.expire, args.obs_interval, _ranges(args.ignore),
+        log=_signal_logger(store), floor_alpha=args.floor_alpha, hysteresis_db=args.hysteresis,
+        overload_db=args.overload_db, warn=_warn_logger(store),
+    )
+
+
+def _begin_scan(args, store: Store, mode: str) -> None:
+    """Record this scan's frequency ranges, so the baselines know when each frequency was being watched.
+    Replaying a file is not a scan of the air, so it is not recorded."""
+    if getattr(args, "source", None):
+        return
+    ranges = [tuple(float(x) for x in r.split(":")) for r in _sweep_ranges(args.freq or ["1:6000"])]
+    store.begin_scan(ranges, mode)
+
+
+class AlertWatcher:
+    """While a scan runs, log each new baseline flag (louder, gone quiet, ...) once, in the log."""
+
+    def __init__(self, store: Store, interval: float = 60.0, max_per_poll: int = 8):
+        self.store = store
+        self.interval = interval
+        self.max_per_poll = max_per_poll
+        self._last = time.monotonic()
+        self._reported: set = set()
+        self._failed = False
+
+    def poll(self, quiet: bool = False, force: bool = False) -> None:
+        if not force and time.monotonic() - self._last < self.interval:
+            return
+        self._last = time.monotonic()
+        try:
+            result = baseline.evaluate(self.store.conn)
+        except (sqlite3.Error, ValueError) as exc:  # alerts are a bonus; never let them stop a scan
+            if not self._failed:
+                self._failed = True
+                _say(self.store, f"alerts unavailable: {exc}", level="warn", source="baseline", quiet=quiet)
+            return
+        current = {(f["signal_id"], f["kind"]): f for f in result["flags"]}
+        fresh = [f for key, f in current.items() if key not in self._reported]
+        self._reported = set(current)  # a flag that clears and comes back is reported again
+        for f in fresh[: self.max_per_poll]:
+            alert = f["severity"] == "alert"
+            _say(
+                self.store, f"{'ALERT' if alert else 'notice'}  #{f['signal_id']} {f['center_hz'] / 1e6:.3f} MHz  {f['message']}",
+                level="warn" if alert else "info", source="baseline", quiet=quiet,
+            )
+        if len(fresh) > self.max_per_poll:
+            _say(self.store, f"... and {len(fresh) - self.max_per_poll} more flag(s): see `hackrf-scout anomalies`", source="baseline", quiet=quiet)
+
+
 def _signal_logger(store: Store) -> Callable[[str], None]:
     def log(msg: str) -> None:
         print(msg)
@@ -156,7 +224,8 @@ def _signal_logger(store: Store) -> Callable[[str], None]:
     return log
 
 
-def do_scan(args, store: Store, scanner: Scanner, duration: Optional[float], sweeps: Optional[int], quiet: bool) -> Tuple[int, bool]:
+def do_scan(args, store: Store, scanner: Scanner, duration: Optional[float], sweeps: Optional[int], quiet: bool,
+            watcher: Optional["AlertWatcher"] = None) -> Tuple[int, bool]:
     """Returns (sweeps processed, interrupted). A negative count means no data arrived at all."""
     lines, close, proc, what = _line_source(args, sweeps, store)
     _say(store, what, quiet=quiet)
@@ -169,6 +238,8 @@ def do_scan(args, store: Store, scanner: Scanner, duration: Optional[float], swe
         for sweep in iter_sweeps(lines):
             res = scanner.process(sweep)
             n += 1
+            if watcher is not None:
+                watcher.poll(quiet)
             if n % 10 == 0 or time.monotonic() - last_progress >= 15:
                 last_progress = time.monotonic()
                 _say(
@@ -209,9 +280,9 @@ def cmd_scan(args) -> int:
             ident = _identifier(args)
             if not ident.has_database:
                 _say(store, "Note: no Artemis database found - using the built-in bandplan only. Run `hackrf-scout update-db` once.", level="warn")
-            scanner = Scanner(store, ident, args.snr, args.min_hits, args.expire, args.obs_interval, _ranges(args.ignore),
-                              log=_signal_logger(store))
-            n, _ = do_scan(args, store, scanner, args.duration, args.sweeps, args.quiet)
+            scanner = _scanner(args, store, ident)
+            _begin_scan(args, store, "scan")
+            n, _ = do_scan(args, store, scanner, args.duration, args.sweeps, args.quiet, AlertWatcher(store))
             if n < 0:
                 return 2
             total = len(store.load_signals())
@@ -231,14 +302,15 @@ def cmd_run(args) -> int:
         store = Store(args.db)
         try:
             ident = _identifier(args)
-            scanner = Scanner(store, ident, args.snr, args.min_hits, args.expire, args.obs_interval, _ranges(args.ignore),
-                              log=_signal_logger(store))
+            scanner = _scanner(args, store, ident)
+            _begin_scan(args, store, "run")
+            watcher = AlertWatcher(store)
             cycle = 0
             try:
                 while args.cycles == 0 or cycle < args.cycles:
                     cycle += 1
                     _say(store, f"[cycle {cycle}] scanning for {args.scan_seconds:.0f} s ...")
-                    n, interrupted = do_scan(args, store, scanner, args.scan_seconds, None, args.quiet)
+                    n, interrupted = do_scan(args, store, scanner, args.scan_seconds, None, args.quiet, watcher)
                     if n < 0:
                         return 2
                     if interrupted:
@@ -371,6 +443,39 @@ def cmd_export(args) -> int:
     return 0
 
 
+def cmd_anomalies(args) -> int:
+    from . import query
+
+    try:
+        conn = query.connect_ro(args.db)
+    except query.DatabaseUnavailable as exc:
+        raise RuntimeError(str(exc))
+    try:
+        result = baseline.evaluate(conn, kinds=args.kind or None)
+    except ValueError as exc:
+        raise RuntimeError(str(exc))
+    finally:
+        conn.close()
+    if args.json:
+        json.dump(result, sys.stdout, indent=2)
+        print()
+        return 0
+    if result["ref"] is None:
+        print("No scan data yet.")
+        return 0
+    ref = baseline.parse_ts(result["ref"])
+    age = (datetime.now() - ref).total_seconds() if ref else 0
+    print(f"Compared with each signal's own baseline, as of {result['ref']} (the scanner last looked {baseline.fmt_duration(age)} ago)")
+    if not result["flags"]:
+        print("Nothing unusual.")
+    for f in result["flags"]:
+        print(f"  {'ALERT ' if f['severity'] == 'alert' else 'notice'}  #{f['signal_id']:<5d} {f['center_hz'] / 1e6:>10.3f} MHz  {f['kind']:<12s} {f['message']}")
+    lr = result["learning"]
+    if not lr["new_alerts_ready"]:
+        print(f"\nNew-signal alerts need {baseline.fmt_duration(lr['needed_s'])} of earlier scanning; {baseline.fmt_duration(lr['history_s'])} so far.")
+    return 0
+
+
 def cmd_update_db(args) -> int:
     from . import artemisdb
 
@@ -458,6 +563,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--limit", type=int)
     p.add_argument("-v", "--verbose", action="store_true", help="show top candidate matches")
     p.set_defaults(fn=cmd_report)
+
+    p = sub.add_parser("anomalies", help="signals that are louder, quieter, gone quiet or new compared with their own baseline")
+    common(p)
+    p.add_argument("--kind", action="append", choices=list(baseline.KINDS), help="only this kind of flag (repeatable)")
+    p.add_argument("--json", action="store_true", help="machine-readable output")
+    p.set_defaults(fn=cmd_anomalies)
 
     p = sub.add_parser("export", help="export signals as CSV or JSON")
     common(p)

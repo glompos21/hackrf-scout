@@ -47,6 +47,13 @@ CREATE TABLE IF NOT EXISTS captures(
   ts TEXT NOT NULL, path TEXT NOT NULL,
   center_hz REAL, sample_rate REAL, seconds REAL
 );
+CREATE TABLE IF NOT EXISTS scans(
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  started_at TEXT NOT NULL,
+  last_ts TEXT NOT NULL,
+  mode TEXT,
+  ranges TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS log(
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   ts TEXT NOT NULL,
@@ -68,10 +75,29 @@ class Store:
         self.conn.commit()
         self._log_buf: collections.deque = collections.deque()
         self._log_inserts = 0
+        self.scan_id: Optional[int] = None
 
     def close(self) -> None:
+        if self.scan_id is not None:  # the last sweep summary can be up to obs_interval old
+            self.touch_scan(datetime.now().isoformat(timespec="seconds"))
         self.commit()
         self.conn.close()
+
+    # ---- scan sessions -------------------------------------------------
+    def begin_scan(self, ranges_mhz: Iterable[tuple], mode: str = "scan", started_at: Optional[str] = None) -> int:
+        """Record that a scan of these ranges (MHz) has started. The baseline code uses these sessions to
+        know when each frequency was actually being watched."""
+        now = started_at or datetime.now().isoformat(timespec="seconds")
+        ranges = [[float(lo) * 1e6, float(hi) * 1e6] for lo, hi in ranges_mhz]
+        cur = self.conn.execute(
+            "INSERT INTO scans(started_at,last_ts,mode,ranges) VALUES(?,?,?,?)", (now, now, mode, json.dumps(ranges))
+        )
+        self.scan_id = int(cur.lastrowid)
+        return self.scan_id
+
+    def touch_scan(self, ts: str) -> None:
+        if self.scan_id is not None:
+            self.conn.execute("UPDATE scans SET last_ts=? WHERE id=? AND last_ts<?", (ts, self.scan_id, ts))
 
     # ---- log -----------------------------------------------------------
     def log(self, msg: str, level: str = "info", source: str = "scout") -> None:
@@ -107,6 +133,7 @@ class Store:
 
     def add_sweep_summary(self, ts: str, bins: int, detections: int, floor_db: float) -> None:
         self.conn.execute("INSERT INTO sweeps(ts,bins,detections,floor_db) VALUES(?,?,?,?)", (ts, bins, detections, floor_db))
+        self.touch_scan(ts)
 
     # ---- signals -------------------------------------------------------
     def insert_signal(self, **f: Any) -> int:

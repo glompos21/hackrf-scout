@@ -17,6 +17,9 @@ from unittest import mock
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from world import World, wobble  # noqa: E402
+
 from hackrf_scout import bands as bandlib  # noqa: E402
 from hackrf_scout import controller, query, simulate  # noqa: E402
 from hackrf_scout import store as store_mod  # noqa: E402
@@ -286,7 +289,7 @@ class QueryTests(unittest.TestCase):
             query.band_activity(self.conn, self.reg.resolve("868"), "century")
 
     def test_raw_table_browser_is_whitelisted(self):
-        self.assertEqual({t["name"] for t in query.table_counts(self.conn)}, {"signals", "observations", "sweeps", "captures", "log", "meta"})
+        self.assertEqual({t["name"] for t in query.table_counts(self.conn)}, {"signals", "observations", "sweeps", "captures", "scans", "log", "meta"})
         r = query.browse_table(self.conn, "log", page_size=2)
         self.assertEqual((r["total"], len(r["rows"]), r["columns"][0]), (3, 2, "id"))
         for name in ("sqlite_master", "signals; DROP TABLE x", "../etc"):
@@ -484,6 +487,20 @@ sys.exit(simulate.main(sys.argv[1:]))
 """
 
 
+FAKE_SWEEP_OVERLOAD = """#!@PY@
+import sys
+from datetime import datetime, timedelta
+sys.path.insert(0, "@ROOT@")
+from hackrf_scout import simulate
+t0 = datetime.now().replace(microsecond=0)
+for i in range(14):
+    simulate.NOISE_DB = -60.0 if i in (8, 9) else -72.0  # two sweeps with the whole floor 12 dB up
+    for line in simulate.generate(1, 400, 100e3, 1, seed=i, t0=t0 + timedelta(seconds=i)):
+        sys.stdout.write(line)
+sys.stdout.flush()
+"""
+
+
 class FakeTools(unittest.TestCase):
     """Base class: a temp dir with fake hackrf_* executables, a state dir and a database path."""
 
@@ -651,6 +668,55 @@ class CliBandTests(FakeTools):
         self.assertEqual(r.returncode, 2)
         self.assertIn("unknown band", r.stderr)
         self.assertNotIn("Traceback", r.stderr)
+
+    def test_a_scan_records_its_session_and_a_replay_does_not(self):
+        sweep = self.script("hackrf_sweep", FAKE_SWEEP_RECORD)
+        self.cli("scan", "--db", self.db, "-f", "868", "-f", "433", "--sweeps", "4", "--quiet", "--hackrf-sweep", sweep, check=True)
+        sim = os.path.join(self.tmp.name, "sim.csv")
+        with open(sim, "w") as fh:
+            fh.writelines(simulate.generate(1, 300, 100e3, 3))
+        self.cli("scan", "--db", self.db, "--source", sim, "--quiet", check=True)
+        con = sqlite3.connect(self.db)
+        self.addCleanup(con.close)
+        rows = con.execute("SELECT started_at, last_ts, mode, ranges FROM scans").fetchall()
+        self.assertEqual(len(rows), 1)  # the replay left no session
+        self.assertEqual(rows[0][2], "scan")
+        self.assertEqual(json.loads(rows[0][3]), [[863e6, 870e6], [433e6, 435e6]])
+        self.assertGreaterEqual(rows[0][1], rows[0][0])
+
+    def test_a_floor_jump_is_skipped_and_logged_end_to_end(self):
+        sweep = self.script("hackrf_sweep", FAKE_SWEEP_OVERLOAD)
+        r = self.cli("scan", "--db", self.db, "--sweeps", "14", "--obs-interval", "1", "--hackrf-sweep", sweep, check=True)
+        self.assertIn("sweep skipped, possible receiver overload", r.stderr)
+        con = sqlite3.connect(self.db)
+        self.addCleanup(con.close)
+        rows = con.execute("SELECT level, source, msg FROM log WHERE level='warn' AND source='detect'").fetchall()
+        self.assertEqual(len(rows), 2, rows)
+        self.assertIn("noise floor moved", rows[0][2])
+        self.assertEqual(con.execute("SELECT value FROM meta WHERE key='sweep_count'").fetchone()[0], "12")  # 14 sweeps, 2 skipped
+        self.assertGreaterEqual(con.execute("SELECT COUNT(*) FROM signals").fetchone()[0], 2)  # and the signals were still found
+        off = self.cli("scan", "--db", os.path.join(self.tmp.name, "off.db"), "--sweeps", "14", "--quiet", "--overload-db", "0", "--hackrf-sweep", sweep)
+        self.assertEqual(off.returncode, 0)
+        self.assertNotIn("skipped", off.stderr)
+
+    def test_anomalies_command(self):
+        w = World(self.db)
+        sid = w.signal(868.3, first=0)  # known for hours, so only its level is unusual
+        w.observations(sid, wobble(40) + [29, 28, 30, 28, 29], start=215)
+        w.scan(0, 240)
+        w.commit()
+        w.close()
+        out = self.cli("anomalies", "--db", self.db, check=True).stdout
+        self.assertIn("ALERT", out)
+        self.assertIn("louder", out)
+        self.assertIn("868.300 MHz", out)
+        data = json.loads(self.cli("anomalies", "--db", self.db, "--json", check=True).stdout)
+        self.assertEqual([f["kind"] for f in data["flags"]], ["louder"])
+        none = self.cli("anomalies", "--db", self.db, "--kind", "quieter", check=True).stdout
+        self.assertIn("Nothing unusual", none)
+        missing = self.cli("anomalies", "--db", os.path.join(self.tmp.name, "absent.db"))
+        self.assertEqual(missing.returncode, 2)
+        self.assertIn("not found", missing.stderr)
 
     def test_report_band_names(self):
         make_db(self.db)
@@ -866,6 +932,73 @@ class WebApiTests(unittest.TestCase):
         self.assertEqual((r.status_code, r.json()["detail"]), (409, "a scanner is already running"))
         self.stub.error = controller.ControlError("mode must be 'scan' or 'run'", 400)
         self.assertEqual(c.post("/api/scanner/start", json={"mode": "x"}).status_code, 400)
+
+    # ---- baselines and alerts
+    def flagged_world(self):
+        w = World(os.path.join(self.tmp.name, "flags.db"))
+        self.loud = w.signal(868.3, first=0)
+        w.observations(self.loud, wobble(40) + [29, 28, 30, 28, 29], start=215)
+        self.steady = w.signal(433.9, first=0)
+        w.observations(self.steady, wobble(45), start=215)
+        w.signal(915.0, first=0, last=160)
+        w.observations(w.store.conn.execute("SELECT MAX(id) FROM signals").fetchone()[0], wobble(120), start=100)
+        w.scan(0, 240)
+        w.commit()
+        w.close()
+        return w.path
+
+    def test_anomalies_endpoint(self):
+        c = self.client(db=self.flagged_world(), anomaly_ttl=0)
+        d = c.get("/api/anomalies").json()
+        self.assertEqual(sorted(f["kind"] for f in d["flags"]), ["gone_quiet", "louder"])
+        self.assertEqual(d["ref"], "2026-10-09T12:00:00")
+        self.assertTrue(d["learning"]["new_alerts_ready"])
+        self.assertIn("age_s", d)
+        only = c.get("/api/anomalies", params={"kind": "louder"}).json()
+        self.assertEqual([f["signal_id"] for f in only["flags"]], [self.loud])
+        self.assertEqual(c.get("/api/anomalies", params={"kind": "bogus"}).status_code, 400)
+
+    def test_signal_list_carries_flags_and_can_show_only_flagged(self):
+        c = self.client(db=self.flagged_world(), anomaly_ttl=0)
+        items = {i["id"]: i for i in c.get("/api/signals").json()["items"]}
+        self.assertEqual(items[self.loud]["flags"], ["louder"])
+        self.assertEqual(items[self.steady]["flags"], [])
+        flagged = c.get("/api/signals", params={"flagged": "true"}).json()
+        self.assertEqual(flagged["total"], 2)
+        self.assertEqual(sorted(i["id"] for i in flagged["items"]), sorted([self.loud, 3]))
+        both = c.get("/api/signals", params={"flagged": "true", "band": "868"}).json()  # combines with other filters
+        self.assertEqual([i["id"] for i in both["items"]], [self.loud])
+
+    def test_flagged_filter_with_nothing_flagged_is_empty_not_everything(self):
+        c = self.client(anomaly_ttl=0)  # the plain fixture database has no scans, so no flags
+        r = c.get("/api/signals", params={"flagged": "true"}).json()
+        self.assertEqual((r["total"], r["items"]), (0, []))
+
+    def test_signal_detail_has_its_baseline(self):
+        c = self.client(db=self.flagged_world(), anomaly_ttl=0)
+        d = c.get(f"/api/signals/{self.loud}").json()
+        self.assertFalse(d["baseline"]["learning"])
+        self.assertAlmostEqual(d["baseline"]["baseline"]["median_db"], 20.0, delta=0.5)
+        self.assertEqual([f["kind"] for f in d["baseline"]["flags"]], ["louder"])
+
+    def test_anomalies_are_evaluated_once_per_ttl(self):
+        path = self.flagged_world()
+        c = self.client(db=path, anomaly_ttl=60)
+        first = c.get("/api/anomalies").json()
+        w = sqlite3.connect(path)
+        w.execute("UPDATE signals SET last_seen='2020-01-01T00:00:00'")  # would clear every louder/quieter flag
+        w.commit()
+        w.close()
+        self.assertEqual(c.get("/api/anomalies").json()["flags"], first["flags"])  # cached
+        fresh = self.client(db=path, anomaly_ttl=0)
+        self.assertNotEqual(fresh.get("/api/anomalies").json()["flags"], first["flags"])
+
+    def test_anomalies_need_the_token_and_a_database(self):
+        c = self.client(token=self.TOKEN)
+        self.assertEqual(c.get("/api/anomalies").status_code, 401)
+        self.assertEqual(c.get("/api/anomalies", headers=self.auth()).status_code, 200)
+        missing = self.client(db=os.path.join(self.tmp.name, "absent.db"))
+        self.assertEqual(missing.get("/api/anomalies").status_code, 503)
 
     # ---- live log stream
     def test_log_stream_delivers_new_rows_and_heartbeats(self):
