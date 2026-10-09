@@ -10,6 +10,7 @@ import os
 import re
 import shlex
 import signal
+import sqlite3
 import sys
 import time
 from datetime import datetime
@@ -17,6 +18,8 @@ from typing import Callable, Iterator, List, Optional, Sequence, Tuple
 
 from . import __version__
 from . import bands as bandlib
+from . import baseline
+from . import sigmf
 from .capture import capture_signal
 from .controller import HardwareLock
 from .identify import Identifier
@@ -58,6 +61,9 @@ def _add_scan_args(p: argparse.ArgumentParser) -> None:
     d.add_argument("--expire", type=int, default=20, help="drop unconfirmed candidates after this many sweeps without a hit")
     d.add_argument("--ignore", action="append", metavar="START:STOP", help="MHz range to ignore (repeatable), e.g. known spurs")
     d.add_argument("--obs-interval", type=float, default=30.0, help="seconds between stored observations per signal (default 30)")
+    d.add_argument("--floor-alpha", type=float, default=0.2, help="weight of the newest sweep in the smoothed noise floor, 0-1 (default 0.2; 1 = no smoothing)")
+    d.add_argument("--hysteresis", type=float, default=3.0, help="a confirmed signal stays detected down to SNR minus this many dB (default 3; 0 = off)")
+    d.add_argument("--overload-db", type=float, default=6.0, help="skip sweeps whose noise floor jumps by more than this many dB, usually receiver overload (default 6; 0 = off)")
     i = p.add_argument_group("identification")
     i.add_argument("--signals", help="path to artemis_signals.json (see update-db)")
     i.add_argument("--region-keywords", default="", help="extra comma-separated region words, e.g. greece,cyprus")
@@ -78,8 +84,8 @@ def _say(store: Store, msg: str, level: str = "info", source: str = "scan", quie
     store.log(msg, level=level, source=source)
 
 
-def _hackrf_log(store: Store) -> Callable[[str], None]:
-    """stderr of hackrf_sweep -> log table. It repeats a statistics line every second, so lines that
+def _hackrf_log(store: Store, source: str = "hackrf_sweep") -> Callable[[str], None]:
+    """stderr of hackrf_sweep (or hackrf_transfer) -> log table. It repeats a statistics line every second, so lines that
     differ from the previous one only by digits are logged at most every 30 s."""
     state = {"sig": None, "t": 0.0}
 
@@ -93,7 +99,7 @@ def _hackrf_log(store: Store) -> Callable[[str], None]:
             return
         state["sig"], state["t"] = sig, now
         bad = re.search(r"fail|error|not found|denied|cannot|unable", line, re.I)
-        store.log(line, level="error" if bad else "info", source="hackrf_sweep")
+        store.log(line, level="error" if bad else "info", source=source)
 
     return on_line
 
@@ -148,6 +154,69 @@ def _line_source(args, sweeps: Optional[int], store: Optional[Store] = None):
     return proc.lines(), proc.close, proc, "started " + shlex.join(cmd)
 
 
+def _warn_logger(store: Store) -> Callable[[str], None]:
+    def warn(msg: str) -> None:
+        print("warning: " + msg, file=sys.stderr)
+        store.log(msg, level="warn", source="detect")
+
+    return warn
+
+
+def _scanner(args, store: Store, ident: Identifier) -> Scanner:
+    for name, lo, hi in (("--floor-alpha", args.floor_alpha, (0.001, 1.0)), ("--hysteresis", args.hysteresis, (0.0, 30.0)), ("--overload-db", args.overload_db, (0.0, 60.0))):
+        if not hi[0] <= lo <= hi[1]:
+            raise RuntimeError(f"{name} must be between {hi[0]:g} and {hi[1]:g}")
+    return Scanner(
+        store, ident, args.snr, args.min_hits, args.expire, args.obs_interval, _ranges(args.ignore),
+        log=_signal_logger(store), floor_alpha=args.floor_alpha, hysteresis_db=args.hysteresis,
+        overload_db=args.overload_db, warn=_warn_logger(store),
+    )
+
+
+def _begin_scan(args, store: Store, mode: str) -> None:
+    """Record this scan's frequency ranges, so the baselines know when each frequency was being watched.
+    Replaying a file is not a scan of the air, so it is not recorded."""
+    if getattr(args, "source", None):
+        return
+    ranges = [tuple(float(x) for x in r.split(":")) for r in _sweep_ranges(args.freq or ["1:6000"])]
+    store.begin_scan(ranges, mode)
+
+
+class AlertWatcher:
+    """While a scan runs, log each new baseline flag (louder, gone quiet, ...) once, in the log."""
+
+    def __init__(self, store: Store, interval: float = 60.0, max_per_poll: int = 8):
+        self.store = store
+        self.interval = interval
+        self.max_per_poll = max_per_poll
+        self._last = time.monotonic()
+        self._reported: set = set()
+        self._failed = False
+
+    def poll(self, quiet: bool = False, force: bool = False) -> None:
+        if not force and time.monotonic() - self._last < self.interval:
+            return
+        self._last = time.monotonic()
+        try:
+            result = baseline.evaluate(self.store.conn)
+        except (sqlite3.Error, ValueError) as exc:  # alerts are a bonus; never let them stop a scan
+            if not self._failed:
+                self._failed = True
+                _say(self.store, f"alerts unavailable: {exc}", level="warn", source="baseline", quiet=quiet)
+            return
+        current = {(f["signal_id"], f["kind"]): f for f in result["flags"]}
+        fresh = [f for key, f in current.items() if key not in self._reported]
+        self._reported = set(current)  # a flag that clears and comes back is reported again
+        for f in fresh[: self.max_per_poll]:
+            alert = f["severity"] == "alert"
+            _say(
+                self.store, f"{'ALERT' if alert else 'notice'}  #{f['signal_id']} {f['center_hz'] / 1e6:.3f} MHz  {f['message']}",
+                level="warn" if alert else "info", source="baseline", quiet=quiet,
+            )
+        if len(fresh) > self.max_per_poll:
+            _say(self.store, f"... and {len(fresh) - self.max_per_poll} more flag(s): see `hackrf-scout anomalies`", source="baseline", quiet=quiet)
+
+
 def _signal_logger(store: Store) -> Callable[[str], None]:
     def log(msg: str) -> None:
         print(msg)
@@ -156,7 +225,8 @@ def _signal_logger(store: Store) -> Callable[[str], None]:
     return log
 
 
-def do_scan(args, store: Store, scanner: Scanner, duration: Optional[float], sweeps: Optional[int], quiet: bool) -> Tuple[int, bool]:
+def do_scan(args, store: Store, scanner: Scanner, duration: Optional[float], sweeps: Optional[int], quiet: bool,
+            watcher: Optional["AlertWatcher"] = None) -> Tuple[int, bool]:
     """Returns (sweeps processed, interrupted). A negative count means no data arrived at all."""
     lines, close, proc, what = _line_source(args, sweeps, store)
     _say(store, what, quiet=quiet)
@@ -169,6 +239,8 @@ def do_scan(args, store: Store, scanner: Scanner, duration: Optional[float], swe
         for sweep in iter_sweeps(lines):
             res = scanner.process(sweep)
             n += 1
+            if watcher is not None:
+                watcher.poll(quiet)
             if n % 10 == 0 or time.monotonic() - last_progress >= 15:
                 last_progress = time.monotonic()
                 _say(
@@ -209,9 +281,9 @@ def cmd_scan(args) -> int:
             ident = _identifier(args)
             if not ident.has_database:
                 _say(store, "Note: no Artemis database found - using the built-in bandplan only. Run `hackrf-scout update-db` once.", level="warn")
-            scanner = Scanner(store, ident, args.snr, args.min_hits, args.expire, args.obs_interval, _ranges(args.ignore),
-                              log=_signal_logger(store))
-            n, _ = do_scan(args, store, scanner, args.duration, args.sweeps, args.quiet)
+            scanner = _scanner(args, store, ident)
+            _begin_scan(args, store, "scan")
+            n, _ = do_scan(args, store, scanner, args.duration, args.sweeps, args.quiet, AlertWatcher(store))
             if n < 0:
                 return 2
             total = len(store.load_signals())
@@ -231,14 +303,15 @@ def cmd_run(args) -> int:
         store = Store(args.db)
         try:
             ident = _identifier(args)
-            scanner = Scanner(store, ident, args.snr, args.min_hits, args.expire, args.obs_interval, _ranges(args.ignore),
-                              log=_signal_logger(store))
+            scanner = _scanner(args, store, ident)
+            _begin_scan(args, store, "run")
+            watcher = AlertWatcher(store)
             cycle = 0
             try:
                 while args.cycles == 0 or cycle < args.cycles:
                     cycle += 1
                     _say(store, f"[cycle {cycle}] scanning for {args.scan_seconds:.0f} s ...")
-                    n, interrupted = do_scan(args, store, scanner, args.scan_seconds, None, args.quiet)
+                    n, interrupted = do_scan(args, store, scanner, args.scan_seconds, None, args.quiet, watcher)
                     if n < 0:
                         return 2
                     if interrupted:
@@ -325,15 +398,16 @@ def cmd_report(args) -> int:
     if not rows:
         print("No signals stored yet.")
         return 0
+    watched = {r[0] for r in store.conn.execute("SELECT DISTINCT signal_id FROM bursts")}  # found by watching a band: counted in bursts, not sweeps
     print(f"{'ID':>4} {'MHz':>11} {'BW kHz':>9} {'peak dB':>8} {'SNR':>5} {'hits':>5} {'duty%':>6}  {'last seen':<19}  identification / service")
     for r in rows:
-        duty = min(100.0, 100.0 * r["hits"] / max(1, sweeps - r["first_sweep"] + 1))
+        duty = None if r["id"] in watched else min(100.0, 100.0 * r["hits"] / max(1, sweeps - r["first_sweep"] + 1))
         what = _fmt_ident(r)
         if r["service"] and r["ident_source"] == "artemis":
             what += f"  | {r['service'].split(';')[0]}"
         print(
             f"{r['id']:>4} {r['center_hz'] / 1e6:>11.3f} {r['bandwidth_hz'] / 1e3:>9.1f} {r['max_db']:>8.1f} "
-            f"{r['max_snr']:>5.1f} {r['hits']:>5d} {duty:>6.1f}  {r['last_seen'][:19]:<19}  {what}"
+            f"{r['max_snr']:>5.1f} {r['hits']:>5d} {'-' if duty is None else format(duty, '.1f'):>6}  {r['last_seen'][:19]:<19}  {what}"
         )
         if args.verbose and r["ident_json"]:
             for c in json.loads(r["ident_json"])[:3]:
@@ -368,6 +442,133 @@ def cmd_export(args) -> int:
         out.close()
         print(f"Wrote {len(rows)} signals to {args.out}")
     store.close()
+    return 0
+
+
+def cmd_watch(args) -> int:
+    from . import watch
+
+    for name, value, lo, hi in (
+        ("--snr", args.snr, 1, 60), ("--slice-ms", args.slice_ms, 5, 500), ("--gap-ms", args.gap_ms, 0, 5000),
+        ("--max-burst-s", args.max_burst_s, 0.1, 3600), ("--min-bursts", args.min_bursts, 1, 100),
+        ("--floor-alpha", args.floor_alpha, 0.001, 1), ("--merge-khz", args.merge_khz, 0, 500),
+    ):
+        if not lo <= value <= hi:
+            raise RuntimeError(f"{name} must be between {lo:g} and {hi:g}")
+    registry = bandlib.Registry(bandlib.load_custom(bandlib.default_bands_path())[0])
+    band = None
+    if args.band:
+        try:
+            b = registry.resolve(args.band)
+        except ValueError as exc:
+            raise RuntimeError(str(exc))
+        band = (b.lo_hz, b.hi_hz)
+    recording = None
+    if args.source:
+        if not args.source.endswith(sigmf.META_SUFFIX):
+            raise RuntimeError(f"--source must be a SigMF recording ({sigmf.META_SUFFIX} file)")
+        try:
+            recording = sigmf.read_meta(args.source)
+        except (OSError, ValueError) as exc:
+            raise RuntimeError(str(exc))
+    elif band is None:
+        raise RuntimeError("--band is required: a preset such as 433 or 868, or START:STOP in MHz")
+    try:
+        if recording:
+            plan = watch.plan_window(recording["center_hz"], recording["sample_rate"], *(band or (None, None)))
+        else:
+            plan = watch.plan_band(band[0], band[1], args.rate)
+    except ValueError as exc:
+        raise RuntimeError(str(exc))
+
+    with _hardware(args, "watch"):
+        store = Store(args.db)
+        try:
+            ident = _identifier(args)
+            if not ident.has_database:
+                _say(store, "Note: no Artemis database found - using the built-in bandplan only. Run `hackrf-scout update-db` once.", level="warn")
+            start = datetime.now()
+            if recording:
+                if recording["datetime"]:
+                    try:
+                        start = datetime.fromisoformat(recording["datetime"].replace("Z", "+00:00")).astimezone().replace(tzinfo=None)
+                    except ValueError:
+                        pass
+            else:
+                store.begin_scan([(plan.lo_hz / 1e6, plan.hi_hz / 1e6)], "watch")
+            watcher = watch.Watcher(
+                store, ident, plan, snr_db=args.snr, slice_ms=args.slice_ms, gap_ms=args.gap_ms, max_burst_s=args.max_burst_s,
+                min_bursts=args.min_bursts, candidate_s=args.candidate_min * 60.0, floor_alpha=args.floor_alpha,
+                merge_khz=args.merge_khz, start=start, live=recording is None, log=_signal_logger(store), warn=_warn_logger(store),
+            )
+            stream = None
+            interrupted = False
+            try:
+                if recording:
+                    chunks = watch.file_chunks(recording["data_path"], watcher.slice_bytes)
+                else:
+                    cmd = watch.build_transfer_command(args.hackrf_transfer, plan, args.lna, args.vga, args.amp)
+                    stream = watch.IQProcess(cmd, on_stderr=_hackrf_log(store, "hackrf_transfer"))
+                    _say(store, "started " + shlex.join(cmd), quiet=args.quiet)
+                    store.commit()
+                    chunks = stream.chunks(watcher.slice_bytes)
+                try:
+                    watcher.run(chunks, args.duration)
+                except KeyboardInterrupt:
+                    interrupted = True
+                    _say(store, "Stopping ...")
+            finally:
+                if stream is not None:
+                    stream.close()
+            if stream is not None and watcher.slice_no == 0 and not interrupted:
+                _say(store, "No IQ data received from hackrf_transfer.", level="error")
+                tail = stream.error_text()
+                if tail:
+                    _say(store, tail, level="error", source="hackrf_transfer")
+                _say(store, "Check: `hackrf_info` shows your HackRF, USB permissions (udev rules / sudo), no other app using it.", level="warn")
+                return 2
+            n = store.conn.execute("SELECT COUNT(DISTINCT signal_id) FROM bursts").fetchone()[0]
+            msg = f"Done: watched {watcher.slice_no * watcher.slice_s:.0f} s, {watcher.bursts_total} bursts logged, {n} signals with bursts in {args.db}"
+            print(msg)
+            store.log(msg, source="watch")
+            return 0
+        except RuntimeError as exc:
+            store.log(f"error: {exc}", level="error")
+            raise
+        finally:
+            store.close()
+
+
+def cmd_anomalies(args) -> int:
+    from . import query
+
+    try:
+        conn = query.connect_ro(args.db)
+    except query.DatabaseUnavailable as exc:
+        raise RuntimeError(str(exc))
+    try:
+        result = baseline.evaluate(conn, kinds=args.kind or None)
+    except ValueError as exc:
+        raise RuntimeError(str(exc))
+    finally:
+        conn.close()
+    if args.json:
+        json.dump(result, sys.stdout, indent=2)
+        print()
+        return 0
+    if result["ref"] is None:
+        print("No scan data yet.")
+        return 0
+    ref = baseline.parse_ts(result["ref"])
+    age = (datetime.now() - ref).total_seconds() if ref else 0
+    print(f"Compared with each signal's own baseline, as of {result['ref']} (the scanner last looked {baseline.fmt_duration(age)} ago)")
+    if not result["flags"]:
+        print("Nothing unusual.")
+    for f in result["flags"]:
+        print(f"  {'ALERT ' if f['severity'] == 'alert' else 'notice'}  #{f['signal_id']:<5d} {f['center_hz'] / 1e6:>10.3f} MHz  {f['kind']:<12s} {f['message']}")
+    lr = result["learning"]
+    if not lr["new_alerts_ready"]:
+        print(f"\nNew-signal alerts need {baseline.fmt_duration(lr['needed_s'])} of earlier scanning; {baseline.fmt_duration(lr['history_s'])} so far.")
     return 0
 
 
@@ -458,6 +659,36 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--limit", type=int)
     p.add_argument("-v", "--verbose", action="store_true", help="show top candidate matches")
     p.set_defaults(fn=cmd_report)
+
+    p = sub.add_parser("watch", help="stay tuned to one band and log every burst with its timing (catches what sweeps miss)")
+    common(p)
+    p.add_argument("--band", metavar="NAME|START:STOP", help="the band to watch: a preset such as 433 or 868, or a MHz range up to about 14 MHz wide")
+    p.add_argument("--rate", type=float, help="sample rate in Hz (default: chosen from the band)")
+    p.add_argument("-l", "--lna", type=int, default=24, help="LNA gain 0-40 dB, 8 dB steps (default 24)")
+    p.add_argument("-g", "--vga", type=int, default=20, help="VGA gain 0-62 dB, 2 dB steps (default 20)")
+    p.add_argument("-a", "--amp", action="store_true", help="enable the +14 dB RF amp (off by default)")
+    p.add_argument("--snr", type=float, default=10.0, help="dB above the noise floor to count as a signal (default 10)")
+    p.add_argument("--slice-ms", type=float, default=20.0, help="length of one time slice, which is the timing resolution (default 20)")
+    p.add_argument("--gap-ms", type=float, default=60.0, help="silence that ends a burst, so repeats inside it count as one transmission (default 60)")
+    p.add_argument("--max-burst-s", type=float, default=10.0, help="cut a continuous signal into bursts of at most this long (default 10)")
+    p.add_argument("--merge-khz", type=float, default=50.0, help="detections this close in one slice are one transmission, since an FSK signal has two lobes (default 50)")
+    p.add_argument("--min-bursts", type=int, default=2, help="bursts at a new frequency before it becomes a signal (default 2; known signals count at once)")
+    p.add_argument("--candidate-min", type=float, default=10.0, help="minutes to wait for that second burst (default 10)")
+    p.add_argument("--floor-alpha", type=float, default=0.05, help="weight of the newest slice in the noise floor, 0-1 (default 0.05)")
+    p.add_argument("--duration", type=float, help="stop after this many seconds (of recording time)")
+    p.add_argument("--source", metavar="FILE.sigmf-meta", help="replay a SigMF recording instead of using the hardware")
+    p.add_argument("--hackrf-transfer", default="hackrf_transfer", help="path to hackrf_transfer")
+    p.add_argument("--signals", help="path to artemis_signals.json (see update-db)")
+    p.add_argument("--region-keywords", default="", help="extra comma-separated region words, e.g. greece,cyprus")
+    p.add_argument("--min-score", type=float, default=55.0, help="minimum Artemis match score to accept (default 55)")
+    p.add_argument("--quiet", action="store_true")
+    p.set_defaults(fn=cmd_watch)
+
+    p = sub.add_parser("anomalies", help="signals that are louder, quieter, gone quiet or new compared with their own baseline")
+    common(p)
+    p.add_argument("--kind", action="append", choices=list(baseline.KINDS), help="only this kind of flag (repeatable)")
+    p.add_argument("--json", action="store_true", help="machine-readable output")
+    p.set_defaults(fn=cmd_anomalies)
 
     p = sub.add_parser("export", help="export signals as CSV or JSON")
     common(p)

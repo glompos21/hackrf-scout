@@ -10,6 +10,8 @@ from typing import Any, Dict, Iterable, List, Optional
 
 LOG_KEEP = 5000  # newest log rows kept in the table
 LOG_PRUNE_EVERY = 250  # inserts between prune passes
+BURST_KEEP = 200000  # newest burst rows kept in the table
+BURST_PRUNE_EVERY = 2000
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT);
@@ -47,6 +49,22 @@ CREATE TABLE IF NOT EXISTS captures(
   ts TEXT NOT NULL, path TEXT NOT NULL,
   center_hz REAL, sample_rate REAL, seconds REAL
 );
+CREATE TABLE IF NOT EXISTS scans(
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  started_at TEXT NOT NULL,
+  last_ts TEXT NOT NULL,
+  mode TEXT,
+  ranges TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS bursts(
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  signal_id INTEGER NOT NULL REFERENCES signals(id) ON DELETE CASCADE,
+  start_ts TEXT NOT NULL,
+  duration_ms REAL NOT NULL,
+  center_hz REAL, bandwidth_hz REAL, peak_db REAL, snr_db REAL,
+  slices INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_bursts_signal ON bursts(signal_id, start_ts);
 CREATE TABLE IF NOT EXISTS log(
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   ts TEXT NOT NULL,
@@ -68,10 +86,30 @@ class Store:
         self.conn.commit()
         self._log_buf: collections.deque = collections.deque()
         self._log_inserts = 0
+        self.scan_id: Optional[int] = None
+        self._burst_inserts = 0
 
     def close(self) -> None:
+        if self.scan_id is not None:  # the last sweep summary can be up to obs_interval old
+            self.touch_scan(datetime.now().isoformat(timespec="seconds"))
         self.commit()
         self.conn.close()
+
+    # ---- scan sessions -------------------------------------------------
+    def begin_scan(self, ranges_mhz: Iterable[tuple], mode: str = "scan", started_at: Optional[str] = None) -> int:
+        """Record that a scan of these ranges (MHz) has started. The baseline code uses these sessions to
+        know when each frequency was actually being watched."""
+        now = started_at or datetime.now().isoformat(timespec="seconds")
+        ranges = [[float(lo) * 1e6, float(hi) * 1e6] for lo, hi in ranges_mhz]
+        cur = self.conn.execute(
+            "INSERT INTO scans(started_at,last_ts,mode,ranges) VALUES(?,?,?,?)", (now, now, mode, json.dumps(ranges))
+        )
+        self.scan_id = int(cur.lastrowid)
+        return self.scan_id
+
+    def touch_scan(self, ts: str) -> None:
+        if self.scan_id is not None:
+            self.conn.execute("UPDATE scans SET last_ts=? WHERE id=? AND last_ts<?", (ts, self.scan_id, ts))
 
     # ---- log -----------------------------------------------------------
     def log(self, msg: str, level: str = "info", source: str = "scout") -> None:
@@ -107,6 +145,7 @@ class Store:
 
     def add_sweep_summary(self, ts: str, bins: int, detections: int, floor_db: float) -> None:
         self.conn.execute("INSERT INTO sweeps(ts,bins,detections,floor_db) VALUES(?,?,?,?)", (ts, bins, detections, floor_db))
+        self.touch_scan(ts)
 
     # ---- signals -------------------------------------------------------
     def insert_signal(self, **f: Any) -> int:
@@ -125,6 +164,28 @@ class Store:
                    last_seen=:last_seen, hits=:hits, max_db=:max_db, avg_db=:avg_db, last_db=:last_db,
                    max_snr=:max_snr, last_snr=:last_snr WHERE id=:id""",
             f,
+        )
+
+    # ---- bursts (watch mode) -------------------------------------------
+    def add_burst(self, signal_id: int, start_ts: str, duration_ms: float, center_hz: float, bw_hz: float, peak_db: float, snr_db: float, slices: int) -> None:
+        self.conn.execute(
+            "INSERT INTO bursts(signal_id,start_ts,duration_ms,center_hz,bandwidth_hz,peak_db,snr_db,slices) VALUES(?,?,?,?,?,?,?,?)",
+            (signal_id, start_ts, duration_ms, center_hz, bw_hz, peak_db, snr_db, slices),
+        )
+        self._burst_inserts += 1
+        if self._burst_inserts >= BURST_PRUNE_EVERY:
+            self._burst_inserts = 0
+            self.conn.execute("DELETE FROM bursts WHERE id <= (SELECT MAX(id) FROM bursts) - ?", (BURST_KEEP,))
+
+    def touch_signal(self, signal_id: int, ts: str, peak_db: float, snr_db: float) -> None:
+        """One more burst of a known signal: count it and keep its level statistics current."""
+        self.conn.execute(
+            """UPDATE signals SET hits=hits+1,
+                   last_seen=CASE WHEN last_seen < ? THEN ? ELSE last_seen END,
+                   avg_db=(COALESCE(avg_db,0)*hits + ?) / (hits + 1),
+                   max_db=MAX(COALESCE(max_db,-1e9), ?), max_snr=MAX(COALESCE(max_snr,0), ?),
+                   last_db=?, last_snr=? WHERE id=?""",
+            (ts, ts, peak_db, peak_db, snr_db, peak_db, snr_db, signal_id),
         )
 
     def add_observation(self, signal_id: int, ts: str, center_hz: float, bw_hz: float, peak_db: float, snr_db: float) -> None:

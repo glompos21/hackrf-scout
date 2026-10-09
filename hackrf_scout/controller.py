@@ -28,6 +28,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from . import bands as bandlib
+from . import watch
 
 try:  # POSIX only; on other platforms the lock is a no-op and control is unavailable
     import fcntl
@@ -152,8 +153,9 @@ class HardwareLock:
 # --------------------------------------------------------------------------- argument building
 _REGION = re.compile(r"^[A-Za-z0-9 ,._-]{0,100}$")
 _SCAN_KEYS = {"mode", "bands", "lna", "vga", "amp", "bin_width", "snr", "min_hits", "expire", "obs_interval",
-              "region_keywords", "duration"}
+              "region_keywords", "duration", "floor_alpha", "hysteresis", "overload_db"}
 _RUN_KEYS = {"scan_seconds", "cycles", "capture_seconds", "capture_max", "capture_which", "capture_min_snr"}
+_WATCH_KEYS = {"mode", "bands", "lna", "vga", "amp", "snr", "region_keywords", "duration", "slice_ms", "min_bursts"}
 
 
 def _num(params: Dict[str, Any], key: str, default: Any, lo: float, hi: float, integer: bool = False, step: int = 0) -> Any:
@@ -196,14 +198,16 @@ def build_scan_args(
     if not isinstance(params, dict):
         raise ValueError("parameters must be an object")
     mode = params.get("mode", "scan")
-    if mode not in ("scan", "run"):
-        raise ValueError("mode must be 'scan' or 'run'")
-    allowed = set(_SCAN_KEYS) | (_RUN_KEYS if mode == "run" else set())
+    if mode not in ("scan", "run", "watch"):
+        raise ValueError("mode must be 'scan', 'run' or 'watch'")
+    allowed = _WATCH_KEYS if mode == "watch" else set(_SCAN_KEYS) | (_RUN_KEYS if mode == "run" else set())
     extra = sorted(set(params) - allowed)
     if extra:
         raise ValueError(f"unknown or unsupported parameter(s) for mode '{mode}': {', '.join(extra)}")
 
     registry = registry or bandlib.Registry()
+    if mode == "watch":
+        return _build_watch_args(params, db, registry, hackrf_transfer)
     specs = params.get("bands") or []
     if not isinstance(specs, list) or len(specs) > 24 or not all(isinstance(s, str) for s in specs):
         raise ValueError("bands must be a list of up to 24 band names or START:STOP ranges")
@@ -224,6 +228,9 @@ def build_scan_args(
     argv += ["--min-hits", str(_num(params, "min_hits", 3, 1, 50, integer=True))]
     argv += ["--expire", str(_num(params, "expire", 20, 1, 1000, integer=True))]
     argv += ["--obs-interval", f"{_num(params, 'obs_interval', 30.0, 1, 3600):g}"]
+    argv += ["--floor-alpha", f"{_num(params, 'floor_alpha', 0.2, 0.001, 1):g}"]
+    argv += ["--hysteresis", f"{_num(params, 'hysteresis', 3.0, 0, 30):g}"]
+    argv += ["--overload-db", f"{_num(params, 'overload_db', 6.0, 0, 60):g}"]
     region = params.get("region_keywords", "")
     if not isinstance(region, str) or not _REGION.match(region):
         raise ValueError("region_keywords may only contain letters, digits, spaces and , . _ -")
@@ -248,6 +255,36 @@ def build_scan_args(
         argv += ["--capture-dir", os.path.abspath(capture_dir)]
         if hackrf_transfer:
             argv += ["--hackrf-transfer", hackrf_transfer]
+    return argv
+
+
+def _build_watch_args(params: Dict[str, Any], db: str, registry: bandlib.Registry, hackrf_transfer: Optional[str]) -> List[str]:
+    specs = params.get("bands") or []
+    if not (isinstance(specs, list) and len(specs) == 1 and isinstance(specs[0], str)):
+        raise ValueError("watch mode needs exactly one band (a preset name or START:STOP in MHz)")
+    band = registry.resolve_many(specs)[0]
+    watch.plan_band(band.lo_hz, band.hi_hz)  # raises a readable error if the band is too wide for one HackRF window
+    argv = [sys.executable, "-m", "hackrf_scout", "watch", "--db", os.path.abspath(db), "--quiet",
+            "--band", f"{band.lo_hz / 1e6:.6f}:{band.hi_hz / 1e6:.6f}"]
+    argv += ["-l", str(_num(params, "lna", 24, 0, 40, integer=True, step=8))]
+    argv += ["-g", str(_num(params, "vga", 20, 0, 62, integer=True, step=2))]
+    amp = params.get("amp", False)
+    if not isinstance(amp, bool):
+        raise ValueError("amp must be true or false")
+    if amp:
+        argv.append("-a")
+    argv += ["--snr", f"{_num(params, 'snr', 10.0, 1, 60):g}"]
+    argv += ["--slice-ms", f"{_num(params, 'slice_ms', 20.0, 5, 500):g}"]
+    argv += ["--min-bursts", str(_num(params, "min_bursts", 2, 1, 100, integer=True))]
+    region = params.get("region_keywords", "")
+    if not isinstance(region, str) or not _REGION.match(region):
+        raise ValueError("region_keywords may only contain letters, digits, spaces and , . _ -")
+    if region.strip():
+        argv += ["--region-keywords", region.strip()]
+    if params.get("duration") not in (None, "", 0):
+        argv += ["--duration", f"{_num(params, 'duration', None, 1, 86400):g}"]
+    if hackrf_transfer:
+        argv += ["--hackrf-transfer", hackrf_transfer]
     return argv
 
 

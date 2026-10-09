@@ -12,6 +12,8 @@ import os
 import secrets
 import sqlite3
 import sys
+import threading
+import time
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -25,6 +27,7 @@ from fastapi.staticfiles import StaticFiles
 from starlette.datastructures import Headers, MutableHeaders
 
 from . import __version__
+from . import baseline
 from . import bands as bandlib
 from . import query
 from .controller import ControlError, ScannerController
@@ -53,6 +56,7 @@ class WebConfig:
     host: str = "127.0.0.1"
     allowed_hosts: Set[str] = field(default_factory=set)
     band_warnings: List[str] = field(default_factory=list)
+    anomaly_ttl: float = 10.0  # seconds a baseline evaluation is reused between requests
 
 
 def _hostname(host_header: str) -> str:
@@ -183,6 +187,18 @@ def create_app(cfg: WebConfig) -> FastAPI:
         finally:
             conn.close()
 
+    anomaly_lock = threading.Lock()
+    anomaly_cache: Dict[str, Any] = {"at": -1e9, "value": None}
+
+    def current_anomalies() -> Dict[str, Any]:
+        """Evaluate the baselines at most once per `anomaly_ttl` seconds, however many tabs are open."""
+        with anomaly_lock:
+            if anomaly_cache["value"] is None or time.monotonic() - anomaly_cache["at"] >= cfg.anomaly_ttl:
+                with ro() as conn:
+                    anomaly_cache["value"] = query.anomalies(conn)
+                anomaly_cache["at"] = time.monotonic()
+            return anomaly_cache["value"]
+
     def signal_filters(
         band: List[str] = Query(default=[]),
         mode: str = Query("overlap"),
@@ -231,6 +247,16 @@ def create_app(cfg: WebConfig) -> FastAPI:
             return {"band": b.to_dict(), "bucket": bucket, "items": query.band_activity(conn, b, bucket, limit, mode)}
 
     # ---- signals
+    @api.get("/anomalies")
+    def get_anomalies(kind: List[str] = Query(default=[])) -> Dict[str, Any]:
+        bad = [k for k in kind if k not in baseline.KINDS]
+        if bad:
+            raise ValueError(f"unknown kind(s): {', '.join(bad)} (use {', '.join(baseline.KINDS)})")
+        res = current_anomalies()
+        if kind:
+            res = {**res, "flags": [x for x in res["flags"] if x["kind"] in kind]}
+        return res
+
     @api.get("/signals")
     def get_signals(
         f: Dict[str, Any] = Depends(signal_filters),
@@ -238,9 +264,12 @@ def create_app(cfg: WebConfig) -> FastAPI:
         order: Optional[str] = None,
         page: int = Query(1, ge=1),
         page_size: int = Query(50, ge=1, le=query.MAX_PAGE_SIZE),
+        flagged: bool = False,
     ) -> Dict[str, Any]:
+        flags = query.flag_map(current_anomalies())
+        ids = list(flags) if flagged else None
         with ro() as conn:
-            return query.list_signals(conn, sort=sort, order=order, page=page, page_size=page_size, **f)
+            return query.list_signals(conn, sort=sort, order=order, page=page, page_size=page_size, ids=ids, flags=flags, **f)
 
     @api.get("/signals/export")
     def export_signals(
@@ -272,6 +301,14 @@ def create_app(cfg: WebConfig) -> FastAPI:
     ) -> Dict[str, Any]:
         with ro() as conn:
             return query.list_observations(conn, signal_id, cfg.registry.resolve_many(band), mode, since, page, page_size, order)
+
+    @api.get("/bursts")
+    def get_bursts(
+        signal_id: Optional[int] = None, order: str = "desc",
+        page: int = Query(1, ge=1), page_size: int = Query(100, ge=1, le=query.MAX_PAGE_SIZE),
+    ) -> Dict[str, Any]:
+        with ro() as conn:
+            return query.list_bursts(conn, signal_id, page, page_size, order)
 
     @api.get("/sweeps")
     def get_sweeps(page: int = Query(1, ge=1), page_size: int = Query(100, ge=1, le=query.MAX_PAGE_SIZE)) -> Dict[str, Any]:

@@ -191,7 +191,7 @@
       const sc = s.scanner || {};
       cls = 'pill';
       if (sc.state === 'running') {
-        text = 'Scanning' + (sc.mode === 'run' ? (sc.phase === 'capturing' ? ' · recording IQ' : ' · with IQ capture') : '');
+        text = sc.mode === 'watch' ? 'Watching a band' : 'Scanning' + (sc.mode === 'run' ? (sc.phase === 'capturing' ? ' · recording IQ' : ' · with IQ capture') : '');
         cls += ' running';
       } else if (sc.state === 'starting' || sc.state === 'stopping') {
         text = sc.state === 'starting' ? 'Starting…' : 'Stopping…';
@@ -226,7 +226,7 @@
     fill(el,
       stat(fmtInt(c.signals), 'signals stored'),
       stat(fmtInt(c.observations), 'observations'),
-      stat(fmtInt(s.sweep_count), 'sweeps processed'),
+      c.bursts ? stat(fmtInt(c.bursts), 'bursts logged') : stat(fmtInt(s.sweep_count), 'sweeps processed'),
       stat(s.last_signal_at ? ago(s.last_signal_at) : '–', 'last signal seen'),
       stat(fmtBytes(s.db_bytes), 'database size'),
     );
@@ -308,7 +308,7 @@
   const FORM_DEFAULTS = {
     mode: 'scan', bands: [], lna: 24, vga: 20, amp: false, snr: 10, min_hits: 3, region_keywords: '', duration: '',
     scan_seconds: 600, capture_seconds: 5, capture_max: 3, capture_which: 'unidentified', capture_min_snr: 15, cycles: 0,
-    bin_width: 100000, expire: 20, obs_interval: 30,
+    bin_width: 100000, expire: 20, obs_interval: 30, floor_alpha: 0.2, hysteresis: 3, overload_db: 6, slice_ms: 20, min_bursts: 2,
   };
   function loadForm() {
     let saved = {};
@@ -328,8 +328,11 @@
   function startForm() {
     const f = loadForm();
     const els = {};
-    const picker = bandPicker(f.bands, () => {});
-    const modeRadios = ['scan', 'run'].map((v) => h('label', { class: 'inline' }, h('input', { type: 'radio', name: 'mode', value: v, checked: f.mode === v, onchange: syncMode }), v === 'scan' ? 'Scan only' : 'Scan and record IQ of new signals'));
+    let picker;
+    const onBands = (list) => { if (currentMode() === 'watch' && list.length > 1) picker.set(list.slice(-1)); };  // watch mode takes one band
+    picker = bandPicker(f.bands, onBands);
+    const MODE_LABEL = { scan: 'Scan only', run: 'Scan and record IQ of new signals', watch: 'Watch one band (catches short bursts)' };
+    const modeRadios = ['scan', 'run', 'watch'].map((v) => h('label', { class: 'inline' }, h('input', { type: 'radio', name: 'mode', value: v, checked: f.mode === v, onchange: syncMode }), MODE_LABEL[v]));
     els.lna = selectOf([0, 8, 16, 24, 32, 40], f.lna);
     els.vga = selectOf(Array.from({ length: 32 }, (_, i) => i * 2), f.vga);
     els.amp = h('input', { type: 'checkbox', checked: f.amp });
@@ -346,26 +349,65 @@
     els.bin_width = numInput(f.bin_width, 2445, 5000000, 1);
     els.expire = numInput(f.expire, 1, 1000);
     els.obs_interval = numInput(f.obs_interval, 1, 3600);
+    els.floor_alpha = numInput(f.floor_alpha, 0.001, 1, 0.05);
+    els.hysteresis = numInput(f.hysteresis, 0, 30, 0.5);
+    els.overload_db = numInput(f.overload_db, 0, 60, 0.5);
+    els.slice_ms = numInput(f.slice_ms, 5, 500, 5);
+    els.min_bursts = numInput(f.min_bursts, 1, 100);
 
     const scanOnly = h('div', { class: 'fields' }, field('Duration (s)', els.duration));
+    els.wduration = numInput(f.duration, 1, 86400, 1, { placeholder: 'no limit' });
+    const watchOnly = h('div', { class: 'form-grid' },
+      h('div', { class: 'fields' }, field('Time slice (ms)', els.slice_ms), field('Bursts to confirm a new signal', els.min_bursts), field('Duration (s)', els.wduration)),
+      h('p', { class: 'muted' }, 'Stays tuned to one band of up to about 14 MHz and logs every burst with its start and length. A shorter slice times short bursts more finely and costs more CPU. '
+        + 'It does not sweep, so signals outside the band are not seen while this runs.'));
     const runOnly = h('div', { class: 'fields' }, field('Scan seconds per cycle', els.scan_seconds), field('IQ seconds', els.capture_seconds), field('Max captures per cycle', els.capture_max), field('Capture which', els.capture_which));
     const output = h('div');
     const startBtn = h('button', { type: 'submit', class: 'primary' }, 'Start scanning');
     const checkBtn = h('button', { type: 'button' }, 'Check device');
 
-    const currentMode = () => (modeRadios.some((l) => $('input', l).checked && $('input', l).value === 'run') ? 'run' : 'scan');
+    const currentMode = () => {
+      const on = modeRadios.map((l) => $('input', l)).find((i) => i.checked);
+      return on ? on.value : 'scan';
+    };
+    const freqHint = h('p', { class: 'muted' });
+    const hitsField = field('Hits to confirm', els.min_hits);
+    const advanced = h('details', null, h('summary', null, 'Advanced'),
+      h('div', { class: 'fields' }, field('Bin width (Hz)', els.bin_width), field('Expire (sweeps)', els.expire), field('Observation interval (s)', els.obs_interval),
+        field('Capture min SNR (dB)', els.capture_min_snr), field('Run cycles (0 = forever)', els.cycles)),
+      h('div', { class: 'fields' }, field('Noise floor smoothing (1 = off)', els.floor_alpha), field('Hysteresis (dB, 0 = off)', els.hysteresis),
+        field('Overload guard (dB, 0 = off)', els.overload_db)),
+      h('p', { class: 'muted' }, 'Smoothing steadies the noise floor over sweeps. Hysteresis lets a confirmed signal stay detected a few dB below the threshold. '
+        + 'The overload guard skips sweeps whose noise floor jumps by more than this, which usually means a strong transmitter is overloading the receiver.'));
     function syncMode() {
-      const run = currentMode() === 'run';
-      runOnly.hidden = !run;
-      scanOnly.hidden = run;
+      const mode = currentMode();
+      runOnly.hidden = mode !== 'run';
+      scanOnly.hidden = mode !== 'scan';
+      watchOnly.hidden = mode !== 'watch';
+      hitsField.hidden = mode === 'watch';
+      advanced.hidden = mode === 'watch';
+      startBtn.textContent = mode === 'watch' ? 'Start watching' : 'Start scanning';
+      if (mode === 'watch') {
+        if (picker.get().length > 1) picker.set(picker.get().slice(-1));
+        freqHint.textContent = 'Pick the one band to watch, such as 433 or 868 (up to about 14 MHz wide).';
+      } else {
+        freqHint.textContent = 'Nothing selected scans the whole 1–6000 MHz range. Narrow bands are revisited much faster, which helps with short bursts.';
+      }
     }
 
     function collect() {
       const mode = currentMode();
+      if (mode === 'watch') {
+        const w = { mode, bands: picker.get(), lna: +els.lna.value, vga: +els.vga.value, amp: els.amp.checked, snr: +els.snr.value, slice_ms: +els.slice_ms.value, min_bursts: +els.min_bursts.value };
+        if (els.region_keywords.value.trim()) w.region_keywords = els.region_keywords.value.trim();
+        if (els.wduration.value) w.duration = +els.wduration.value;
+        return w;
+      }
       const p = {
         mode, bands: picker.get(), lna: +els.lna.value, vga: +els.vga.value, amp: els.amp.checked,
         snr: +els.snr.value, min_hits: +els.min_hits.value, bin_width: +els.bin_width.value,
         expire: +els.expire.value, obs_interval: +els.obs_interval.value,
+        floor_alpha: +els.floor_alpha.value, hysteresis: +els.hysteresis.value, overload_db: +els.overload_db.value,
       };
       if (els.region_keywords.value.trim()) p.region_keywords = els.region_keywords.value.trim();
       if (mode === 'scan') {
@@ -395,21 +437,17 @@
           toast(e.message, 'err');
         } finally {
           startBtn.disabled = false;
-          startBtn.textContent = 'Start scanning';
+          syncMode();
           refreshStatus();
         }
       },
     },
     h('fieldset', null, h('legend', null, 'Mode'), h('div', { class: 'row' }, modeRadios)),
-    h('fieldset', null, h('legend', null, 'Frequencies'), picker.el,
-      h('p', { class: 'muted' }, 'Nothing selected scans the whole 1–6000 MHz range. Narrow bands are revisited much faster, which helps with short bursts.')),
+    h('fieldset', null, h('legend', null, 'Frequencies'), picker.el, freqHint),
     h('fieldset', null, h('legend', null, 'Receiver and detection'),
       h('div', { class: 'fields' }, field('LNA gain (dB)', els.lna), field('VGA gain (dB)', els.vga),
-        h('label', { class: 'inline' }, els.amp, 'RF amp (+14 dB)'), field('SNR threshold (dB)', els.snr), field('Hits to confirm', els.min_hits), field('Region keywords', els.region_keywords))),
-    scanOnly, runOnly,
-    h('details', null, h('summary', null, 'Advanced'),
-      h('div', { class: 'fields' }, field('Bin width (Hz)', els.bin_width), field('Expire (sweeps)', els.expire), field('Observation interval (s)', els.obs_interval),
-        field('Capture min SNR (dB)', els.capture_min_snr), field('Run cycles (0 = forever)', els.cycles))),
+        h('label', { class: 'inline' }, els.amp, 'RF amp (+14 dB)'), field('SNR threshold (dB)', els.snr), hitsField, field('Region keywords', els.region_keywords))),
+    scanOnly, watchOnly, runOnly, advanced,
     h('div', { class: 'row' }, startBtn, checkBtn, h('span', { class: 'muted' }, 'Receive only. The tool never transmits.')),
     output);
 
@@ -551,11 +589,38 @@
     return el;
   }
 
+  const KIND_LABEL = { louder: 'louder', quieter: 'quieter', gone_quiet: 'gone quiet', new_in_quiet: 'new in quiet area' };
+
+  function renderAlerts(card, data) {
+    const flags = data.flags || [];
+    const alerts = flags.filter((f) => f.severity === 'alert').length;
+    const head = h('div', { class: 'row' }, h('h2', null, 'Alerts'),
+      flags.length ? h('span', { class: 'badge ' + (alerts ? 'err' : 'warn') }, `${flags.length}`) : null, h('span', { class: 'spacer' }),
+      data.ref ? h('span', { class: 'muted' }, `compared with each signal's own baseline, as of ${fmtTime(data.ref)}${data.age_s > 90 ? ` (scanner last ran ${ago(data.ref)})` : ''}`) : null);
+    const learning = data.learning && !data.learning.new_alerts_ready
+      ? h('p', { class: 'muted' }, `New-signal alerts need about ${Math.round(data.learning.needed_s / 60)} min of earlier scanning; ${Math.round(data.learning.history_s / 60)} min so far.`)
+      : null;
+    if (!flags.length) {
+      fill(card, head, h('p', { class: 'muted' }, data.ref ? 'Nothing unusual: every signal looks like itself.' : 'No scan data yet.'), learning);
+      return;
+    }
+    fill(card, head, h('div', { class: 'table-wrap' }, h('table', null, h('tbody', null, flags.map((f) => h('tr', { class: 'click', tabindex: 0, onclick: () => openSignal(f.signal_id), onkeydown: (e) => { if (e.key === 'Enter') openSignal(f.signal_id); } },
+      h('td', null, h('span', { class: 'badge ' + (f.severity === 'alert' ? 'err' : 'warn') }, KIND_LABEL[f.kind] || f.kind)),
+      h('td', { class: 'num mono' }, `#${f.signal_id} · ${fmtMHz(f.center_hz)} MHz`),
+      h('td', { class: 'wrap' }, f.ident_name ? [h('b', null, f.ident_name), ' '] : null, f.message)))))), learning);
+  }
+
   function viewLive(root) {
     const ac = new AbortController();
     const statsEl = h('div', { class: 'stats' });
     const ctrl = h('section', { class: 'card' });
+    const alertsCard = h('section', { class: 'card', 'aria-label': 'Alerts' });
     let sig = null;
+    const pollAlerts = async () => {
+      try { renderAlerts(alertsCard, await api('/api/anomalies', { signal: ac.signal })); } catch (e) { if (!ac.signal.aborted) fill(alertsCard, h('h2', null, 'Alerts'), errorNote(e)); }
+    };
+    pollAlerts();
+    const alertTimer = setInterval(() => { if (!document.hidden) pollAlerts(); }, 10000);
     const onStatus = (s) => {
       renderStats(statsEl, s);
       const now = controlSig(s);
@@ -563,16 +628,16 @@
       const up = $('#uptime');
       if (up && s.scanner && s.scanner.started_at) up.textContent = '(' + ago(s.scanner.started_at) + ')';
     };
-    root.append(statsEl, ctrl, buildLog(ac.signal));
+    root.append(statsEl, alertsCard, ctrl, buildLog(ac.signal));
     statusListeners.add(onStatus);
     if (state.status) onStatus(state.status);
-    return () => { ac.abort(); statusListeners.delete(onStatus); };
+    return () => { ac.abort(); clearInterval(alertTimer); statusListeners.delete(onStatus); };
   }
 
   // ------------------------------------------------------------------ SIGNALS view
   function viewSignals(root, params) {
     const f = {
-      bands: params.getAll('band'), unid: params.get('unid') === '1', hits: params.get('hits') || '', snr: params.get('snr') || '',
+      bands: params.getAll('band'), unid: params.get('unid') === '1', flagged: params.get('flagged') === '1', hits: params.get('hits') || '', snr: params.get('snr') || '',
       q: params.get('q') || '', mode: params.get('mode') || 'overlap', sort: params.get('sort') || 'center_hz', order: params.get('order') || '',
       page: Math.max(1, +params.get('page') || 1), size: +params.get('size') || 50,
     };
@@ -581,18 +646,20 @@
     const picker = bandPicker(f.bands, (b) => { f.bands = b; f.page = 1; load(); });
     const q = h('input', { type: 'search', value: f.q, placeholder: 'Search name, service, notes or #id', 'aria-label': 'Search signals', size: 28, oninput: () => { clearTimeout(timer); timer = setTimeout(() => { f.q = q.value; f.page = 1; load(); }, 300); } });
     const unid = h('input', { type: 'checkbox', checked: f.unid, onchange: () => { f.unid = unid.checked; f.page = 1; load(); } });
+    const flaggedBox = h('input', { type: 'checkbox', checked: f.flagged, onchange: () => { f.flagged = flaggedBox.checked; f.page = 1; load(); } });
     const hits = h('input', { type: 'number', min: 0, value: f.hits, placeholder: '0', onchange: () => { f.hits = hits.value; f.page = 1; load(); } });
     const snr = h('input', { type: 'number', min: 0, step: 0.5, value: f.snr, placeholder: '0', onchange: () => { f.snr = snr.value; f.page = 1; load(); } });
     const mode = h('select', { 'aria-label': 'Band matching', onchange: () => { f.mode = mode.value; load(); } }, option('overlap', 'Any overlap with band'), option('center', 'Centre frequency inside band'));
     mode.value = f.mode;
     const auto = h('input', { type: 'checkbox', onchange: () => { clearInterval(refreshTimer); if (auto.checked) refreshTimer = setInterval(() => { if (!$('.drawer')) load(true); }, 5000); } });
 
-    const apiParams = () => ({ band: f.bands, unidentified: f.unid, min_hits: f.hits || null, min_snr: f.snr || null, q: f.q.trim() || null, mode: f.mode });
+    const apiParams = () => ({ band: f.bands, unidentified: f.unid, flagged: f.flagged, min_hits: f.hits || null, min_snr: f.snr || null, q: f.q.trim() || null, mode: f.mode });
 
     function syncHash() {
       const u = new URLSearchParams();
       f.bands.forEach((b) => u.append('band', b));
       if (f.unid) u.set('unid', '1');
+      if (f.flagged) u.set('flagged', '1');
       if (f.hits) u.set('hits', f.hits);
       if (f.snr) u.set('snr', f.snr);
       if (f.q) u.set('q', f.q);
@@ -611,9 +678,11 @@
       { key: 'snr', label: 'Max SNR', sort: 'max_snr', cls: 'num', cell: (r) => fmtNum(r.max_snr) },
       { key: 'db', label: 'Peak dB', sort: 'max_db', cls: 'num', cell: (r) => fmtNum(r.max_db) },
       { key: 'hits', label: 'Hits', sort: 'hits', cls: 'num', cell: (r) => fmtInt(r.hits) },
+      { key: 'bursts', label: 'Bursts', cls: 'num', cell: (r) => (r.burst_count ? fmtInt(r.burst_count) : '–') },
       { key: 'duty', label: 'Duty %', cls: 'num', cell: (r) => fmtNum(r.duty_pct) },
       { key: 'last', label: 'Last seen', sort: 'last_seen', cell: (r) => fmtTime(r.last_seen) },
       { key: 'ident', label: 'Identification', sort: 'ident_name', cls: 'wrap', cell: identCell },
+      { key: 'flags', label: 'Flags', cell: (r) => (r.flags || []).map((k) => h('span', { class: 'badge ' + (k === 'louder' || k === 'new_in_quiet' ? 'err' : 'warn') }, KIND_LABEL[k] || k)) },
       { key: 'svc', label: 'Service', cls: 'cut', cell: (r) => (r.service || '').split(';')[0] },
     ];
 
@@ -656,7 +725,7 @@
     root.append(h('section', { class: 'card form-grid' },
       h('div', { class: 'row' }, h('h2', null, 'Signals'), h('span', { class: 'spacer' }), h('label', { class: 'inline' }, auto, 'Auto-refresh'), exportBtn('csv'), exportBtn('json')),
       picker.el,
-      h('div', { class: 'fields' }, field('Search', q), h('label', { class: 'inline' }, unid, 'Unidentified only'), field('Min hits', hits), field('Min SNR (dB)', snr), field('Band matching', mode))),
+      h('div', { class: 'fields' }, field('Search', q), h('label', { class: 'inline' }, unid, 'Unidentified only'), h('label', { class: 'inline' }, flaggedBox, 'Flagged only'), field('Min hits', hits), field('Min SNR (dB)', snr), field('Band matching', mode))),
     h('section', { class: 'card' }, results));
     load();
     return () => { clearTimeout(timer); clearInterval(refreshTimer); seq++; closeDrawer(); };
@@ -668,6 +737,36 @@
     document.removeEventListener('keydown', onDrawerKey);
   }
   function onDrawerKey(e) { if (e.key === 'Escape') closeDrawer(); }
+
+  function baselineSection(b) {
+    if (!b) return null;
+    const flags = (b.flags || []).map((f) => h('div', { class: 'note ' + (f.severity === 'alert' ? 'err' : 'warn') }, h('b', null, (KIND_LABEL[f.kind] || f.kind) + ': '), f.message));
+    let body;
+    if (b.learning) {
+      body = h('p', { class: 'muted' }, `Still learning what is normal for this signal: ${b.observations} of ${b.needed} observations so far.`);
+    } else {
+      const g = b.gaps ? ` It usually shows up at least every ${b.gaps.p90_s >= 90 ? Math.round(b.gaps.p90_s / 60) + ' min' : b.gaps.p90_s + ' s'}.` : '';
+      body = h('p', null, `Normally ${fmtNum(b.baseline.median_db)} dB above the noise floor (typically ${fmtNum(b.baseline.p10_db)} to ${fmtNum(b.baseline.p90_db)}). `
+        + `Latest observations: ${b.recent.values.map((v) => fmtNum(v)).join(', ')} dB.${g}`);
+    }
+    return h('div', { class: 'form-grid' }, h('h3', null, 'Compared with its own baseline'), flags, body);
+  }
+
+  function burstSection(b) {
+    if (!b || !b.count) return null;
+    const dur = b.duration_ms;
+    const every = b.interval_s;
+    const fmtMs = (v) => (v >= 1000 ? fmtNum(v / 1000, 2) + ' s' : fmtNum(v, 0) + ' ms');
+    const fmtGap = (v) => (v >= 90 ? fmtNum(v / 60, 1) + ' min' : fmtNum(v, v < 10 ? 2 : 0) + ' s');
+    const lines = [`${fmtInt(b.count)} bursts logged, first ${fmtTime(b.first)}, last ${fmtTime(b.last)}.`];
+    if (dur) lines.push(`Typical length ${fmtMs(dur.median)}` + (fmtMs(dur.p10) === fmtMs(dur.p90) ? '.' : ` (most between ${fmtMs(dur.p10)} and ${fmtMs(dur.p90)}).`));
+    if (every) lines.push(every.regular ? `It repeats about every ${fmtGap(every.median)}, which looks like a timer or a sensor reporting on a schedule.` : `Typically ${fmtGap(every.median)} between bursts, but not on a regular schedule.`);
+    return h('div', { class: 'form-grid' }, h('h3', null, 'Bursts'), h('p', null, lines.join(' ')),
+      h('div', { class: 'table-wrap' }, h('table', null,
+        h('thead', null, h('tr', null, [['Start', ''], ['Length', 'num'], ['MHz', 'num'], ['Peak dB', 'num'], ['SNR dB', 'num']].map(([t, c]) => h('th', { scope: 'col', class: c }, t)))),
+        h('tbody', null, b.recent.map((x) => h('tr', null, h('td', null, fmtTime(x.start_ts) + String(x.start_ts || '').slice(19, 23)), h('td', { class: 'num' }, fmtMs(x.duration_ms)),
+          h('td', { class: 'num mono' }, fmtMHz(x.center_hz)), h('td', { class: 'num' }, fmtNum(x.peak_db)), h('td', { class: 'num' }, fmtNum(x.snr_db))))))));
+  }
 
   async function openSignal(id) {
     closeDrawer();
@@ -685,7 +784,7 @@
       ['Bandwidth', fmtKHz(d.bandwidth_hz) + ' kHz'], ['Peak at', fmtMHz(d.peak_hz || d.center_hz) + ' MHz'],
       ['Max level', fmtNum(d.max_db) + ' dB'], ['Avg level', fmtNum(d.avg_db) + ' dB'],
       ['Max SNR', fmtNum(d.max_snr) + ' dB'], ['Last SNR', fmtNum(d.last_snr) + ' dB'],
-      ['Hits', fmtInt(d.hits)], ['Duty cycle', fmtNum(d.duty_pct) + ' %'],
+      ['Hits', fmtInt(d.hits)], ['Duty cycle', d.duty_pct == null ? '–' : fmtNum(d.duty_pct) + ' %'],
       ['First seen', fmtTime(d.first_seen)], ['Last seen', fmtTime(d.last_seen)],
       ['Identified', fmtTime(d.ident_at)], ['IQ captured', d.captured ? 'yes' : 'no'],
     ];
@@ -694,6 +793,8 @@
       h('div', { class: 'row' }, h('h2', null, `#${d.id} · ${fmtMHz(d.center_hz)} MHz`), h('span', { class: 'spacer' }), closeBtn),
       h('div', null, d.ident_name ? [h('b', null, d.ident_name), ' ', identCell(d).slice(1)] : h('span', { class: 'muted' }, 'Not identified'), d.ident_url ? [' · ', extLink(d.ident_url, 'SigID Wiki')] : null),
       d.label || d.notes ? h('p', null, d.label ? h('b', null, d.label + ' ') : null, d.notes) : null,
+      d.burst_count && d.baseline && d.baseline.learning ? null : baselineSection(d.baseline),  // the baseline is built from sweep observations; a band watcher logs bursts instead
+      burstSection(d.burst_summary),
       h('dl', { class: 'facts' }, facts.map(([k, v]) => [h('dt', null, k), h('dd', null, v)])),
       h('div', null, h('h3', null, 'Bands'), d.bands.length
         ? h('div', { class: 'chips' }, d.bands.map((k) => h('a', { class: 'chip', href: '#/signals?band=' + encodeURIComponent(k), onclick: closeDrawer }, k)))

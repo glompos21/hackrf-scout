@@ -7,16 +7,25 @@ still keeping bursty signals (use a lower --min-hits and a longer --expire).
 
 from __future__ import annotations
 
+import statistics
+from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Callable, List, Optional, Sequence, Tuple
+from typing import Callable, Deque, List, Optional, Sequence, Tuple
 
 import numpy as np
 
-from .detect import Detection, detect_signals
+from .detect import Detection, FloorTracker, detect_signals, estimate_floor
 from .identify import Identifier
 from .store import Store
 from .sweep import Sweep
+
+
+# A sweep with this many detections (and more than DET_FACTOR times the recent median) looks like
+# receiver overload or a burst of ghost signals rather than real activity.
+OVERLOAD_MIN_DETS = 30
+OVERLOAD_DET_FACTOR = 4.0
+OVERLOAD_MAX_SKIPS = 3  # consecutive suspect sweeps before the new level is accepted as real
 
 
 def _parse_ts(ts: str) -> datetime:
@@ -57,6 +66,10 @@ class Scanner:
         obs_interval_s: float = 30.0,
         ignore: Sequence[Tuple[float, float]] = (),
         log: Callable[[str], None] = print,
+        floor_alpha: float = 0.2,
+        hysteresis_db: float = 3.0,
+        overload_db: float = 6.0,
+        warn: Optional[Callable[[str], None]] = None,
     ):
         self.store = store
         self.identifier = identifier
@@ -66,6 +79,15 @@ class Scanner:
         self.obs_interval = obs_interval_s
         self.ignore = list(ignore)
         self.log = log
+        self.warn = warn or (lambda m: log("WARN  " + m))
+        # a confirmed signal stays "present" while its SNR is above snr_db - hysteresis_db;
+        # a new one still has to reach snr_db
+        self.hysteresis_db = max(0.0, hysteresis_db)
+        self.overload_db = max(0.0, overload_db)
+        self.floor_tracker = FloorTracker(alpha=floor_alpha, jump_db=self.overload_db)
+        self._det_history: Deque[int] = deque(maxlen=20)
+        self._spike_run = 0
+        self.skipped_sweeps = 0
         self.tracks: List[Track] = []
         self._centers = np.zeros(0)
         self._dirty = False
@@ -110,11 +132,67 @@ class Scanner:
                 break
         return None
 
+    # ---- sweep quality -------------------------------------------------
+    def _skip(self, sweep: Sweep, floor_db: float, detections: int, reason: str) -> dict:
+        """Ignore a sweep that looks like receiver overload: no hits, no new signals, no sweep number."""
+        self.skipped_sweeps += 1
+        self.warn(f"sweep skipped, possible receiver overload: {reason}")
+        self.store.commit()
+        return {
+            "sweep": self.store.sweep_count(),
+            "detections": detections,
+            "confirmed_new": [],
+            "floor_db": floor_db,
+            "bins": int(sweep.power.size),
+            "skipped": reason,
+        }
+
+    def _detection_spike(self, n: int) -> bool:
+        """True while a sudden flood of detections should be treated as overload (see OVERLOAD_*)."""
+        if not self.overload_db:
+            return False
+        hist = self._det_history
+        if len(hist) >= 5 and n > max(OVERLOAD_MIN_DETS, OVERLOAD_DET_FACTOR * statistics.median(hist)):
+            self._spike_run += 1
+            if self._spike_run < OVERLOAD_MAX_SKIPS:
+                return True
+            self._spike_run = 0  # it lasted: this is the new normal
+            hist.clear()
+        else:
+            self._spike_run = 0
+        hist.append(n)
+        return False
+
     # ---- main entry ----------------------------------------------------
     def process(self, sweep: Sweep) -> dict:
-        dets, floor = detect_signals(
-            sweep.freqs, sweep.power, sweep.bin_hz, snr_db=self.snr_db, ignore=self.ignore
-        )
+        if sweep.power.size == 0:
+            dets, floor = detect_signals(sweep.freqs, sweep.power, sweep.bin_hz, snr_db=self.snr_db, ignore=self.ignore)
+            floor_arr = None
+        else:
+            floor_arr, jump = self.floor_tracker.update(sweep.freqs, estimate_floor(sweep.power, sweep.bin_hz))
+            if jump is not None:
+                return self._skip(
+                    sweep, float(np.median(floor_arr)), 0,
+                    f"the noise floor moved {jump:+.1f} dB (limit {self.overload_db:g} dB)",
+                )
+            if self.floor_tracker.accepted_jump is not None:
+                self.warn(f"the noise floor stayed {self.floor_tracker.accepted_jump:+.1f} dB different: taking it as the new baseline")
+            dets, floor = detect_signals(
+                sweep.freqs, sweep.power, sweep.bin_hz, snr_db=self.snr_db, ignore=self.ignore, floor=floor_arr
+            )
+            if self._detection_spike(len(dets)):
+                return self._skip(
+                    sweep, floor, len(dets),
+                    f"{len(dets)} detections at once (usually ~{statistics.median(self._det_history):.0f})",
+                )
+            if self.hysteresis_db > 0 and floor_arr is not None and any(t.id is not None for t in self.tracks):
+                # look again with a lower threshold: weak detections are kept only if they continue a
+                # confirmed signal (checked in the loop below), so noise cannot start new signals
+                low = max(1.0, self.snr_db - self.hysteresis_db)
+                weak, _ = detect_signals(
+                    sweep.freqs, sweep.power, sweep.bin_hz, snr_db=low, ignore=self.ignore, floor=floor_arr
+                )
+                dets = dets + [d for d in weak if d.snr_db < self.snr_db]
         sweep_no = self.store.bump_sweep()
         now = _parse_ts(sweep.ts)
         used: set = set()
@@ -122,6 +200,8 @@ class Scanner:
 
         for d in dets:
             t = self._match(d, sweep.bin_hz, used)
+            if d.snr_db < self.snr_db and (t is None or t.id is None):
+                continue  # below the threshold for a new signal, and not a confirmed one's continuation
             if t is None:
                 t = Track(
                     center=d.center_hz, bw=d.bw_hz, peak_hz=d.peak_hz, first_seen=sweep.ts, first_sweep=sweep_no
@@ -173,6 +253,7 @@ class Scanner:
             "confirmed_new": [t.id for t in confirmed_now],
             "floor_db": floor,
             "bins": int(sweep.power.size),
+            "skipped": None,
         }
 
     # ---- helpers -------------------------------------------------------

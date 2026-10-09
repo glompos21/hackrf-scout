@@ -13,14 +13,17 @@ import json
 import math
 import os
 import sqlite3
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional, Sequence
 
 from . import bandplan
 from . import bands as bandlib
+from . import baseline
 
-TABLES = ("signals", "observations", "sweeps", "captures", "log", "meta")
+TABLES = ("signals", "observations", "sweeps", "captures", "bursts", "scans", "log", "meta")
 MAX_PAGE_SIZE = 500
+MAX_ID_FILTER = 500  # most flagged signals one list request will filter on
 
 SIGNAL_SORTS = {
     "id", "center_hz", "bandwidth_hz", "first_seen", "last_seen", "hits", "max_db", "max_snr", "last_snr",
@@ -108,6 +111,7 @@ def signal_where(
     min_snr: Optional[float] = None,
     q: Optional[str] = None,
     captured: Optional[bool] = None,
+    ids: Optional[Sequence[int]] = None,
 ) -> tuple:
     clause, params = bandlib.signal_clause(bands, mode, _margin(conn) if bands else 0.0)
     where = [clause, "s.hits >= ?"]
@@ -120,6 +124,10 @@ def signal_where(
     if captured is not None:
         where.append("s.captured = ?")
         params.append(1 if captured else 0)
+    if ids is not None:
+        ids = [int(i) for i in ids][:MAX_ID_FILTER]
+        where.append("s.id IN (" + ",".join("?" * len(ids)) + ")" if ids else "0")
+        params += ids
     if q and q.strip():
         text = q.strip()[:80]
         like = _like(text)
@@ -142,7 +150,7 @@ def status(conn: Optional[sqlite3.Connection], db_path: str) -> Dict[str, Any]:
     except OSError:
         pass
     counts = {}
-    for t in ("signals", "observations", "sweeps", "captures", "log"):
+    for t in ("signals", "observations", "sweeps", "captures", "bursts", "log"):
         counts[t] = conn.execute(f"SELECT COUNT(*) FROM {t}").fetchone()[0] if _has_table(conn, t) else 0
     out["counts"] = counts
     out["sweep_count"] = _meta_int(conn, "sweep_count")
@@ -157,10 +165,19 @@ def status(conn: Optional[sqlite3.Connection], db_path: str) -> Dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------------- signals
-def _signal_item(row: sqlite3.Row, sweeps: int) -> Dict[str, Any]:
+def _signal_item(row: sqlite3.Row, sweeps: int, bursts: int = 0) -> Dict[str, Any]:
     d = _row(row, LIST_COLS)
-    d["duty_pct"] = round(min(100.0, 100.0 * row["hits"] / max(1, sweeps - row["first_sweep"] + 1)), 1)
+    d["burst_count"] = bursts
+    # duty is "share of sweeps it was seen in"; a signal found by watching a band is counted in bursts instead
+    d["duty_pct"] = None if bursts else round(min(100.0, 100.0 * row["hits"] / max(1, sweeps - row["first_sweep"] + 1)), 1)
     return d
+
+
+def _burst_counts(conn: sqlite3.Connection, ids: Sequence[int]) -> Dict[int, int]:
+    if not ids:
+        return {}
+    marks = ",".join("?" * len(ids))
+    return {r[0]: r[1] for r in conn.execute(f"SELECT signal_id, COUNT(*) FROM bursts WHERE signal_id IN ({marks}) GROUP BY signal_id", list(ids))}
 
 
 def list_signals(
@@ -176,7 +193,10 @@ def list_signals(
     order: Optional[str] = None,
     page: int = 1,
     page_size: int = 50,
+    ids: Optional[Sequence[int]] = None,
+    flags: Optional[Dict[int, List[str]]] = None,
 ) -> Dict[str, Any]:
+    """`ids` limits the list to those signals; `flags` ({signal id: [kinds]}) is attached to each item."""
     if sort not in SIGNAL_SORTS:
         raise ValueError(f"sort must be one of {sorted(SIGNAL_SORTS)}")
     if order is None:
@@ -184,22 +204,27 @@ def list_signals(
     if order not in ("asc", "desc"):
         raise ValueError("order must be asc or desc")
     page, page_size, offset = _page(page, page_size)
-    where, params = signal_where(conn, bands, mode, unidentified, min_hits, min_snr, q, captured)
+    where, params = signal_where(conn, bands, mode, unidentified, min_hits, min_snr, q, captured, ids)
     total = conn.execute(f"SELECT COUNT(*) FROM signals s WHERE {where}", params).fetchone()[0]
     rows = conn.execute(
         f"SELECT s.* FROM signals s WHERE {where} ORDER BY s.{sort} {order.upper()}, s.id ASC LIMIT ? OFFSET ?",
         params + [page_size, offset],
     ).fetchall()
     sweeps = _meta_int(conn, "sweep_count")
-    return {"total": total, "page": page, "page_size": page_size, "sort": sort, "order": order,
-            "items": [_signal_item(r, sweeps) for r in rows]}
+    counts = _burst_counts(conn, [r["id"] for r in rows])
+    items = [_signal_item(r, sweeps, counts.get(r["id"], 0)) for r in rows]
+    if flags is not None:
+        for it in items:
+            it["flags"] = flags.get(it["id"], [])
+    return {"total": total, "page": page, "page_size": page_size, "sort": sort, "order": order, "items": items}
 
 
 def signal_detail(conn: sqlite3.Connection, signal_id: int, registry: bandlib.Registry, obs_limit: int = 300) -> Optional[Dict[str, Any]]:
     r = conn.execute("SELECT * FROM signals WHERE id=?", (signal_id,)).fetchone()
     if r is None:
         return None
-    d = _signal_item(r, _meta_int(conn, "sweep_count"))
+    d = _signal_item(r, _meta_int(conn, "sweep_count"), _burst_counts(conn, [signal_id]).get(signal_id, 0))
+    d["burst_summary"] = burst_summary(conn, signal_id) if d["burst_count"] else None
     cands: List[Any] = []
     if r["ident_json"]:
         try:
@@ -215,7 +240,41 @@ def signal_detail(conn: sqlite3.Connection, signal_id: int, registry: bandlib.Re
     obs = conn.execute("SELECT * FROM observations WHERE signal_id=? ORDER BY ts DESC, id DESC LIMIT ?", (signal_id, obs_limit)).fetchall()
     d["observations"] = [_row(o) for o in obs]
     d["captures"] = [_row(c) for c in conn.execute("SELECT * FROM captures WHERE signal_id=? ORDER BY ts DESC", (signal_id,)).fetchall()]
+    d["baseline"] = baseline.signal_baseline(conn, signal_id)
     return d
+
+
+def burst_summary(conn: sqlite3.Connection, signal_id: int, recent: int = 20) -> Dict[str, Any]:
+    """How long a signal's bursts last, how often they come, and the latest few."""
+    rows = conn.execute(
+        "SELECT start_ts, duration_ms, center_hz, bandwidth_hz, peak_db, snr_db, slices FROM bursts WHERE signal_id=? "
+        "ORDER BY start_ts DESC, id DESC LIMIT 500", (signal_id,),
+    ).fetchall()
+    total, first, last = conn.execute("SELECT COUNT(*), MIN(start_ts), MAX(start_ts) FROM bursts WHERE signal_id=?", (signal_id,)).fetchone()
+    out: Dict[str, Any] = {"count": total, "first": first, "last": last, "recent": [_row(r) for r in rows[:recent]]}
+    if not rows:
+        return out
+    durations = sorted(r["duration_ms"] for r in rows)
+    out["duration_ms"] = {"median": round(durations[len(durations) // 2], 1), "p10": round(durations[len(durations) // 10], 1), "p90": round(durations[(len(durations) * 9) // 10], 1)}
+    times = [t for t in (baseline.parse_ts(r["start_ts"]) for r in reversed(rows)) if t is not None]
+    gaps = sorted((b - a).total_seconds() for a, b in zip(times, times[1:]) if b > a)
+    if len(gaps) >= 3:
+        med = gaps[len(gaps) // 2]
+        mad = sorted(abs(g - med) for g in gaps)[len(gaps) // 2]
+        out["interval_s"] = {"median": round(med, 3), "regular": bool(med > 0 and mad / med < 0.15), "n": len(gaps)}
+    return out
+
+
+def list_bursts(conn: sqlite3.Connection, signal_id: Optional[int] = None, page: int = 1, page_size: int = 100, order: str = "desc") -> Dict[str, Any]:
+    if order not in ("asc", "desc"):
+        raise ValueError("order must be asc or desc")
+    page, page_size, offset = _page(page, page_size)
+    where, params = ("WHERE signal_id = ?", [int(signal_id)]) if signal_id is not None else ("", [])
+    total = conn.execute(f"SELECT COUNT(*) FROM bursts {where}", params).fetchone()[0]
+    rows = conn.execute(
+        f"SELECT * FROM bursts {where} ORDER BY start_ts {order.upper()}, id {order.upper()} LIMIT ? OFFSET ?", params + [page_size, offset]
+    ).fetchall()
+    return {"total": total, "page": page, "page_size": page_size, "items": [_row(r) for r in rows]}
 
 
 def export_signals(conn: sqlite3.Connection, fmt: str, with_observations: bool = False, **filters: Any) -> Iterator[str]:
@@ -294,6 +353,22 @@ def list_sweeps(conn: sqlite3.Connection, page: int = 1, page_size: int = 100) -
 
 def list_captures(conn: sqlite3.Connection, page: int = 1, page_size: int = 100) -> Dict[str, Any]:
     return _simple_list(conn, "captures", page, page_size)
+
+
+# ---------------------------------------------------------------------------------- anomalies
+def anomalies(conn: sqlite3.Connection, kinds: Optional[Sequence[str]] = None) -> Dict[str, Any]:
+    """Baseline flags, plus how old the data they are based on is."""
+    res = baseline.evaluate(conn, kinds=kinds)
+    ref = baseline.parse_ts(res["ref"]) if res["ref"] else None
+    res["age_s"] = max(0, round((datetime.now() - ref).total_seconds())) if ref else None
+    return res
+
+
+def flag_map(result: Dict[str, Any]) -> Dict[int, List[str]]:
+    out: Dict[int, List[str]] = {}
+    for f in result["flags"]:
+        out.setdefault(f["signal_id"], []).append(f["kind"])
+    return out
 
 
 # ---------------------------------------------------------------------------------- bands
