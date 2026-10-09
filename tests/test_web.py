@@ -289,7 +289,7 @@ class QueryTests(unittest.TestCase):
             query.band_activity(self.conn, self.reg.resolve("868"), "century")
 
     def test_raw_table_browser_is_whitelisted(self):
-        self.assertEqual({t["name"] for t in query.table_counts(self.conn)}, {"signals", "observations", "sweeps", "captures", "scans", "log", "meta"})
+        self.assertEqual({t["name"] for t in query.table_counts(self.conn)}, {"signals", "observations", "sweeps", "captures", "bursts", "scans", "log", "meta"})
         r = query.browse_table(self.conn, "log", page_size=2)
         self.assertEqual((r["total"], len(r["rows"]), r["columns"][0]), (3, 2, "id"))
         for name in ("sqlite_master", "signals; DROP TABLE x", "../etc"):
@@ -830,7 +830,7 @@ class WebApiTests(unittest.TestCase):
     # ---- read API
     def test_status(self):
         s = self.client().get("/api/status").json()
-        self.assertEqual(s["counts"], {"signals": 6, "observations": 3, "sweeps": 1, "captures": 0, "log": 3})
+        self.assertEqual(s["counts"], {"signals": 6, "observations": 3, "sweeps": 1, "captures": 0, "bursts": 0, "log": 3})
         self.assertEqual((s["sweep_count"], s["db_exists"], s["control_enabled"], s["token_required"]), (30, True, False, False))
         self.assertEqual(s["scanner"]["state"], "stopped")
 

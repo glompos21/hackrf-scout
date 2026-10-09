@@ -33,6 +33,9 @@ hackrf-scout scan -f 433 -f 868 -f 2.4ghz
 # Scan 10 minutes, then record 5 s of IQ from the best new signals, repeat forever
 hackrf-scout run --scan-seconds 600 --capture-seconds 5 --capture-max 5
 
+# Stay tuned to one band and log every burst with its start time and length
+hackrf-scout watch --band 433           # or 868, or any START:STOP in MHz up to about 14 MHz wide
+
 # Look at what was found
 hackrf-scout report                     # everything
 hackrf-scout report --unidentified -v   # the interesting ones, with candidate matches
@@ -71,7 +74,7 @@ Run it on the machine that has the HackRF and `scout.db` (SQLite's WAL mode does
 | **Live** | Scanner status, counters, and the **live log**: new signals, sweep progress, the output of `hackrf_sweep`, errors. With `--allow-control` it also has the start/stop form. |
 | **Signals** | Every stored signal, filtered by band, identification, hits, SNR or text; sortable and paged. Click a row for candidates, bands, signal-strength history and observations. CSV/JSON export of the current filter. |
 | **Bands** | One row per band (433, 868, 2.4 GHz, ...): signal count, unidentified count, best SNR, activity over time, and the `scan -f` command that revisits only that band. |
-| **Data** | Read-only view of every table in the database (`signals`, `observations`, `sweeps`, `captures`, `scans`, `log`, `meta`). |
+| **Data** | Read-only view of every table in the database (`signals`, `observations`, `bursts`, `sweeps`, `captures`, `scans`, `log`, `meta`). |
 
 ### Bands
 
@@ -89,8 +92,8 @@ When you scan, `hackrf_sweep` needs whole MHz, so a band is rounded outwards (43
 
 ### Start and stop from the browser
 
-* The server starts `hackrf-scout scan` or `run` as a **separate, detached process**, so a scan keeps going if you close the browser or restart the web server. Stop sends SIGINT: the scanner finishes its current sweep, commits and exits (SIGTERM, then SIGKILL, only if it does not).
-* The HackRF can only be used by one program, so every `scan`, `run` and `capture` now holds a lock (`~/.hackrf-scout/scanner.lock`, a kernel `flock`, so a crash never leaves it stuck). A second start gets a clear error; the web UI shows scans started from a terminal too, and can stop them. Replaying a file with `scan --source` needs no hardware and takes no lock.
+* The server starts `hackrf-scout scan`, `run` or `watch` as a **separate, detached process**, so a scan keeps going if you close the browser or restart the web server. Stop sends SIGINT: the scanner finishes its current sweep, commits and exits (SIGTERM, then SIGKILL, only if it does not).
+* The HackRF can only be used by one program, so every `scan`, `run`, `watch` and `capture` holds a lock (`~/.hackrf-scout/scanner.lock`, a kernel `flock`, so a crash never leaves it stuck). A second start gets a clear error; the web UI shows scans started from a terminal too, and can stop them. Replaying a file with `scan --source` or `watch --source` needs no hardware and takes no lock.
 * Stopping loses signal candidates that have not yet reached `--min-hits`; confirmed signals and the sweep counter are kept.
 * The form only offers receive modes and fixed, validated ranges. The database, executables and capture folder come from the server's command line (`--db`, `--hackrf-sweep`, `--hackrf-transfer`, `--capture-dir`), never from the browser. Linux and macOS only.
 
@@ -103,7 +106,7 @@ When you scan, `hackrf_sweep` needs whole MHz, so a band is rounded outwards (43
 
 ### API
 
-JSON under `/api` (all `GET` unless noted): `status`, `anomalies`, `signals` (`band`, `mode`, `unidentified`, `flagged`, `min_hits`, `min_snr`, `q`, `sort`, `order`, `page`, `page_size`), `signals/{id}`, `signals/export?format=csv|json`, `observations`, `sweeps`, `captures`, `bands`, `bands/summary`, `bands/activity`, `tables`, `tables/{name}`, `log?tail=N|after=ID`, `log/stream` (server-sent events, resumes with `Last-Event-ID`), `scanner`, and `POST scanner/start|stop|check` (only with `--allow-control`).
+JSON under `/api` (all `GET` unless noted): `status`, `anomalies`, `signals` (`band`, `mode`, `unidentified`, `flagged`, `min_hits`, `min_snr`, `q`, `sort`, `order`, `page`, `page_size`), `signals/{id}`, `signals/export?format=csv|json`, `observations`, `bursts` (`signal_id`, `order`, `page`, `page_size`), `sweeps`, `captures`, `bands`, `bands/summary`, `bands/activity`, `tables`, `tables/{name}`, `log?tail=N|after=ID`, `log/stream` (server-sent events, resumes with `Last-Event-ID`), `scanner`, and `POST scanner/start|stop|check` (only with `--allow-control`).
 
 ## Steadier detection
 
@@ -134,6 +137,28 @@ hackrf-scout anomalies [--kind louder] [--json]
 * While a scan runs, each new flag is written to the log once a minute at most (`ALERT ...` / `notice ...`). In the web UI they show on the Live tab, as badges in the Signals table (with a "Flagged only" filter) and in each signal's detail.
 * Thresholds are in `hackrf_scout/baseline.py` (`BaselineConfig`). They are reasonable starting points, not tuned on real captures; expect to adjust them for your site.
 
+## Watch one band
+
+`hackrf_sweep` hops across the spectrum and gets back to a frequency every 1-3 s, so a transmission that lasts 50 ms (a key fob, a weather sensor, a LoRa packet) is usually missed. `watch` does the opposite: the HackRF stays tuned to one band and streams IQ (`hackrf_transfer -r -`), and every burst is logged with when it started and how long it lasted.
+
+```bash
+hackrf-scout watch --band 433                  # 433.05-434.79 MHz
+hackrf-scout watch --band 868 --duration 3600  # one hour on the 863-870 MHz SRD band
+hackrf-scout watch --band 430:432 --slice-ms 10 --min-bursts 1
+hackrf-scout watch --source capture.sigmf-meta --band 433   # replay a recording, no HackRF needed
+```
+
+In the web UI choose **Watch one band** in the start form (one band only; the Signals table then gets a *Bursts* column and each signal's detail lists its bursts and how regularly they repeat).
+
+How it works:
+
+* The stream is cut into slices (20 ms by default, `--slice-ms`). Each slice becomes a power spectrum with about 12 kHz bins, the same detector as the sweeps runs on it, and detections that follow one another from slice to slice are joined into a **burst**. The two lobes of an FSK signal count as one burst (`--merge-khz`), and a pause of up to 60 ms inside a transmission does not end it (`--gap-ms`). A transmission longer than 10 s is cut into pieces (`--max-burst-s`).
+* A burst that only fills part of its first or last slice shows proportionally less power there, which is used to place its start and end between slice boundaries. Bursts of about two slices or more are timed to roughly a millisecond; shorter ones to within a slice. Times come from the sample clock, so they stay exact when the computer is busy. The log warns when the computer cannot keep up (about 20% of real time is typical at 6-10 Msps).
+* Bursts are linked to a signal in the database: a known one near that frequency, or a new one once it has been seen `--min-bursts` times (2 by default, so a single noise spike does not create a signal). New signals are identified the same way as sweep detections. Signals found by watching show a burst count instead of a duty cycle, which only makes sense for sweeps.
+* The HackRF has a spike at its tune centre. When the sample rate allows it (433 MHz at 6 Msps) the window is tuned so the spike is outside the band; otherwise (868 MHz at 10 Msps) the few bins at the centre are ignored and the log says where.
+* The band is limited by what the HackRF can sample: about 14 MHz at the maximum of 20 Msps, narrower bands run at a lower rate and use less CPU. `--rate` overrides the choice.
+* SNR is measured in finer bins than the sweeps use, so it is not comparable with a sweep's SNR. Baselines and alerts (`anomalies`) are built from sweep observations, so they do not apply to signals that were only ever watched.
+
 ## How identification works
 
 Each stored signal is scored against every Artemis entry: **frequency 40 + bandwidth 30 + region 10**, shown as a percentage. The best entry becomes the name when it scores at least `--min-score` (default 55). Two details matter:
@@ -150,7 +175,7 @@ Treat names as leads, not facts. Many consumer devices (key fobs, sensors) share
 | Too many weak/false detections | raise `--snr` (12–15) or `--min-hits` (5) |
 | Missing weak signals | lower `--snr` (7–8), add `-a`, or scan narrower ranges so each sweep is faster |
 | Overload / ghost signals near strong transmitters | lower `-l`/`-g`, leave `-a` off, use `--ignore` for known spurs |
-| Short bursts (LoRa, remotes, TPMS) missed | sweeps are about 1–3 s over the whole range; scan only the relevant bands (`-f 433:435`) for much faster revisits |
+| Short bursts (LoRa, remotes, TPMS) missed | sweeps are about 1–3 s over the whole range, so a 50 ms burst is usually missed. Use `watch --band 433` (see "Watch one band"), or at least scan only the relevant bands (`-f 433:435`) for faster revisits |
 | A real signal keeps dropping out at the threshold | `--hysteresis 4` (or higher), or a slightly lower `--snr` |
 | "sweep skipped, possible receiver overload" in the log | A strong transmitter is overloading the front end: lower `-l`/`-g`, turn `-a` off, move the antenna. If the new level is real, the guard accepts it after 3 sweeps; `--overload-db 0` turns it off |
 | Frequency resolution | `-w 100000` is the default; smaller bins resolve narrow signals better but slow the sweep |
@@ -161,11 +186,12 @@ Treat names as leads, not facts. Many consumer devices (key fobs, sensors) share
 * `hackrf_sweep` and `hackrf_transfer` cannot use the HackRF at the same time, so IQ capture only happens between scan cycles (`run`). Signals that are not transmitting during the capture window produce silent recordings.
 * The HackRF has 8-bit ADC and image/spur products. Very strong signals produce ghost copies; check anything suspicious with a lower gain.
 * Only what is on the air during the scan is seen. Intermittent signals need long runs.
+* `watch` sees one window of at most about 14 MHz and does not sweep, so nothing outside it is seen while it runs. A signal that fills the whole band (a wideband jammer, a Wi-Fi channel in a narrow window) cannot be told from a raised noise floor.
 * The simulator tests the pipeline, not real-world false-positive rates. Expect to tune `--snr`, `--min-hits` and `--ignore` for your location.
 
 ## Files
 
-* `scout.db`: SQLite with tables `signals`, `observations`, `sweeps`, `captures`, `scans` (one row per scan session with its frequency ranges, used by the baselines), `log` (the last 5000 log lines, shown in the web UI), `meta`.
+* `scout.db`: SQLite with tables `signals`, `observations`, `bursts` (one row per burst found by `watch`: start time, length, frequency, level), `sweeps`, `captures`, `scans` (one row per scan session with its frequency ranges, used by the baselines), `log` (the last 5000 log lines, shown in the web UI), `meta`.
 * `~/.hackrf-scout/`: `scanner.lock` and `scanner.json` (who is using the HackRF), `scanner.out` (console output of a scan started from the browser), optional `bands.json`. Override the folder with `HACKRF_SCOUT_STATE_DIR`.
 * `captures/`: IQ recordings in [SigMF](https://sigmf.org). Each is a pair: `sigNNNN_<freq>MHz_<time>.sigmf-data` is signed 8-bit interleaved I/Q, byte for byte what `hackrf_transfer` writes (SigMF calls it `ci8`), and the `.sigmf-meta` next to it holds the sample rate, centre frequency, UTC start time, gains, a SHA-512 of the data, and an annotation with the signal's estimated frequency edges and what it was identified as. SigMF-aware tools need nothing else; a tool that wants raw I/Q can read the `.sigmf-data` file as it is.
 

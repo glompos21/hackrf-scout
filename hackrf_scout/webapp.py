@@ -302,6 +302,14 @@ def create_app(cfg: WebConfig) -> FastAPI:
         with ro() as conn:
             return query.list_observations(conn, signal_id, cfg.registry.resolve_many(band), mode, since, page, page_size, order)
 
+    @api.get("/bursts")
+    def get_bursts(
+        signal_id: Optional[int] = None, order: str = "desc",
+        page: int = Query(1, ge=1), page_size: int = Query(100, ge=1, le=query.MAX_PAGE_SIZE),
+    ) -> Dict[str, Any]:
+        with ro() as conn:
+            return query.list_bursts(conn, signal_id, page, page_size, order)
+
     @api.get("/sweeps")
     def get_sweeps(page: int = Query(1, ge=1), page_size: int = Query(100, ge=1, le=query.MAX_PAGE_SIZE)) -> Dict[str, Any]:
         with ro() as conn:
