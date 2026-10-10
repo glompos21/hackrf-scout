@@ -1,0 +1,3 @@
+09d63127641d4534893a4e12d8796bfd  classify.py
+f745d97d266417a5f5e9447962787567  thresholds.json
+8a1b294a5b0a2e7d9a3aaa36f2d6c86a  conf_table.json

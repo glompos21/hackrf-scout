@@ -1,0 +1,10 @@
+{
+  "L": 64,
+  "k_adj": 2,
+  "p_capture": 0.001,
+  "asym": 3.0,
+  "grid_step": 0.5,
+  "p_dechirp": 0.01,
+  "pfa_pulse": 1e-8,
+  "pulse": {"n_min": 8, "cv_max": 0.35, "multiple_min": 0.7, "duty_max": 0.25, "jitter_max": 0.2, "n_cluster_min": 5}
+}

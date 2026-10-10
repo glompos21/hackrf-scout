@@ -1,0 +1,16 @@
+{
+ "z_struct": 5.5,
+ "carrier_bins": 12.0,
+ "bw_narrow_hz": 25000.0,
+ "bw_wide_hz": 450000.0,
+ "hop_n_ch": 3,
+ "hop_n_hops": 8,
+ "hop_conc_max": 0.2,
+ "hop_dwell_min_frames": 3,
+ "cp_z": 10.0,
+ "cp_A": 0.02,
+ "cp_comb_max": 0.5,
+ "cp_lagB_min": 24.0,
+ "cp_npk_max": 6,
+ "_provenance": "tune seeds 0-9 only; results/tune.jsonl; conventions: bw_narrow_hz, bw_wide_hz; z_struct = max(5.5, noise max + 0.5)"
+}

@@ -1,0 +1,19 @@
+{
+ "env_const": 0.006,
+ "env_var": 0.08,
+ "psk_env": 0.012,
+ "psk_z": 60,
+ "psk_ratio": 5.0,
+ "fsk_z": 30.0,
+ "fsk_ratio": 8.0,
+ "periodic_acf": 0.5,
+ "carrier_peak3": 0.9,
+ "am_peak3": 0.7,
+ "ook_sup": 0.65,
+ "ook_sup_label": 0.35,
+ "ook_n1_max": 0.9,
+ "pulse_top2": 0.25,
+ "fm_snr_min": -1,
+ "snr_min": -6,
+ "band2": 0.3
+}
